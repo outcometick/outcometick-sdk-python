@@ -5,7 +5,7 @@
   scripts/publish-sdk-repos.mjs and overwritten wholesale on each publish.
   An edit made here survives until the next publish and then disappears.
 
-  Generated from monorepo revision 0ad1fd0cb6d49a6ceca5b70175f0ebeeaa207b6d.
+  Generated from monorepo revision c210f1ac8cbf693e62cc5b3c5580b0f8663e495a.
 -->
 
 # outcometick
@@ -61,6 +61,37 @@ empty equity curve.
 ```
 pip install . && python -m unittest discover -s tests
 ```
+
+## Downloading data
+
+The other half of the package, on a separate import because it has nothing to do
+with writing a strategy:
+
+```python
+from outcometick.data import DataClient, NO_VALUE
+
+ot = DataClient()                                  # key from OT_KEY
+
+meta = ot.meta()                                   # what can this key see?
+
+res = ot.files(
+    from_="2026-08-01", to="2026-08-12",           # or date="2026-08-12"
+    asset=["BTCUSD", "ETHUSD"],                    # a list means "any of these"
+    dataset="prices",
+    interval=["5m", NO_VALUE],                     # "5m" alone EXCLUDES the
+)                                                  # period-less settlement streams
+
+ot.download(res["files"][0], save_to="btc.csv.gz")  # checksum verified
+```
+
+`from_` rather than `from`, because `from` is a Python keyword; it goes on the
+wire as `from`.
+
+`meta()["intervals"]` holds real durations only — the `none` sentinel is
+reported separately under `filterTokens`, so code that builds an enum from it
+or parses the values as durations never meets a token.
+
+Standard library only: no `requests`, no dependency added to your project.
 
 ## Running a backtest
 

@@ -1,9 +1,16 @@
 [project]
 name = "outcometick"
-version = "1.4.0"
+version = "1.4.1"
 description = "Strategy SDK for outcometick prediction-market backtests"
 readme = "README.md"
-requires-python = ">=3.14"
+# Deliberately looser than the sandbox, which pins 3.14.
+#
+# This package is the SDK SURFACE — the Strategy base class and the Order value
+# object — so an editor and a type checker can see the API. Pinning it to the
+# sandbox's runtime would stop anyone on 3.12 or 3.13 from installing even the
+# type hints, which helps nobody: the strategy still has to run on 3.14, and
+# that is checked server-side where it can actually be enforced.
+requires-python = ">=3.10"
 license = { text = "MIT" }
 
 [project.urls]

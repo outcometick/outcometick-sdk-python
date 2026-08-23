@@ -8,6 +8,8 @@ license = { text = "MIT" }
 
 [project.urls]
 Documentation = "https://outcometick.com/docs/sdk"
+Source = "https://github.com/outcometick/outcometick-sdk-python"
+Issues = "https://github.com/outcometick/outcometick-sdk-python/issues"
 
 [build-system]
 requires = ["setuptools>=68"]

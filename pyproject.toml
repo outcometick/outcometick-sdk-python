@@ -3,7 +3,7 @@ name = "outcometick"
 version = "1.4.0"
 description = "Strategy SDK for outcometick prediction-market backtests"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 license = { text = "MIT" }
 
 [project.urls]

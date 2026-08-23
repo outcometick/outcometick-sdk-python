@@ -1,0 +1,20 @@
+[project]
+name = "outcometick"
+version = "1.4.0"
+description = "Strategy SDK for outcometick prediction-market backtests"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+
+[project.urls]
+Documentation = "https://outcometick.com/docs/sdk"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["outcometick"]
+
+[tool.setuptools.package-data]
+outcometick = ["py.typed"]

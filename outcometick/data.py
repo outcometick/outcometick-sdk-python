@@ -159,7 +159,10 @@ class DataClient:
         :param to:       inclusive end; defaults to ``from_``.
         :param venue:    ``polymarket`` | ``predict-fun``
         :param dataset:  ``prices`` | ``twap60s`` | ``book`` | ... (see meta())
-        :param asset:    ``BTCUSD``, ``ETHUSD``, ...
+        :param asset:    the BASE symbol -- ``BTC``, ``ETH``, ``SOL``, ... NOT
+                         the pair. Files are named ``BTCUSD-...`` but the
+                         dimension is ``BTC``; ``"BTCUSD"`` matches nothing.
+                         ``meta()["assets"]`` lists the real values.
         :param interval: ``5m``, ``1h``, ... or ``NO_VALUE`` for the streams
                          that have no period
 

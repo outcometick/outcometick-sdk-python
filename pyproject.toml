@@ -1,6 +1,6 @@
 [project]
 name = "outcometick"
-version = "1.6.0"
+version = "1.6.1"
 description = "Strategy SDK for outcometick prediction-market backtests"
 readme = "README.md"
 # Deliberately looser than the sandbox, which pins 3.14.

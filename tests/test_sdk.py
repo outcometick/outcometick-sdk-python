@@ -69,3 +69,43 @@ class TestStrategy(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStrictNumbers(unittest.TestCase):
+    """The SDK accepts numbers, not things that can be coerced into numbers.
+
+    The engine was tightened first, and the SDK kept coercing — so
+    ``Order(limit=[0.5])`` raised TypeError in Python while
+    ``new Order({limit:[0.5]})`` quietly became 0.5 in JavaScript. One
+    published SDK, two languages, two behaviours, from the same input.
+
+    `float('0.5')` and `Number('0.5')` agree; `float([0.5])` and
+    `Number([0.5])` do not. Coercion is not validation, and the two languages
+    do not coerce alike.
+    """
+
+    def test_a_limit_must_be_a_number(self):
+        for bad in ['0.5', [0.5], True, float('nan'), float('inf')]:
+            with self.assertRaises(ValueError, msg=f'{bad!r} was accepted as a limit'):
+                Order(side='UP', size=10, limit=bad)
+
+    def test_a_size_must_be_a_number(self):
+        for bad in ['10', [10], True, float('inf'), float('nan'), 0, -1]:
+            with self.assertRaises(ValueError, msg=f'{bad!r} was accepted as a size'):
+                Order(side='UP', size=bad)
+
+    def test_a_notional_must_be_a_number_with_a_limit(self):
+        for bad in ['80', [80], True, float('inf'), float('nan'), 0, -1]:
+            with self.assertRaises(ValueError, msg=f'{bad!r} was accepted as a notional'):
+                Order(side='UP', notional=bad, limit=0.5)
+        # And a budget with no ceiling has no conversion.
+        with self.assertRaises(ValueError):
+            Order(side='UP', notional=80)
+
+    def test_the_legal_values_still_work(self):
+        # Tightening a check is only correct if it does not refuse the product.
+        for limit in [0, 0.5, 1]:
+            self.assertEqual(Order(side='UP', size=10, limit=limit).limit, float(limit))
+        self.assertEqual(Order(side='UP', size=2.5).size, 2.5)
+        # floor(80 / 0.64) is 125 — the boundary where Python's `//` disagrees.
+        self.assertEqual(Order(side='UP', notional=80, limit=0.64).size, 125)

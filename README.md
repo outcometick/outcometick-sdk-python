@@ -5,7 +5,7 @@
   scripts/publish-sdk-repos.mjs and overwritten wholesale on each publish.
   An edit made here survives until the next publish and then disappears.
 
-  Generated from monorepo revision 9d6438cf5fc09aaf300f94b7208855eb374e7d63.
+  Generated from monorepo revision 1007b41be56ff3e933622ab514e74ce1f9df1663.
 -->
 
 # outcometick
@@ -102,8 +102,11 @@ distributed on npm because there is exactly one of it for both languages:
 npm i -g outcometick
 ot check .          # the same validator the queue runs
 ot run   .          # replay locally against sample data
-ot submit .         # send it to the queue
+ot submit . --assets btc --days 30   # send it to the queue
 ```
+
+Backtests cover only the most recent 35 archived days (breaking in
+2.0); an earlier range is refused with `E_SCOPE`, naming the current window.
 
 It runs Python strategies by spawning your local `python3`. Two CLIs would mean
 two copies of the validator, and the second copy is what makes

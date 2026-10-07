@@ -5,7 +5,7 @@
   scripts/publish-sdk-repos.mjs and overwritten wholesale on each publish.
   An edit made here survives until the next publish and then disappears.
 
-  Generated from monorepo revision 1007b41be56ff3e933622ab514e74ce1f9df1663.
+  Generated from monorepo revision ea8198ba3b54eade145409e1fbea5395ea1bb3f7.
 -->
 
 # outcometick
@@ -90,6 +90,23 @@ wire as `from`.
 `meta()["intervals"]` holds real durations only — the `none` sentinel is
 reported separately under `filterTokens`, so code that builds an enum from it
 or parses the values as durations never meets a token.
+
+### Smart-money trade history (coming soon)
+
+A separate subscription with its own key: daily files of the trades made by the
+top-ranked Polymarket traders. Until it is on sale these calls answer 503.
+
+```python
+import os
+smart = DataClient(key=os.environ["OT_SMART_KEY"])
+days = smart.smart_days()["days"]                          # newest first
+day = next((d["day"] for d in days if d["lists"].get("top100", {}).get("status") == "published"), None)
+if day:
+    smart.smart_download(day, "top100", save_to="top100.csv.zst")   # verified
+```
+
+What the lists are and what each column means:
+https://outcometick.com/polymarket-smart-money-data
 
 Standard library only: no `requests`, no dependency added to your project.
 

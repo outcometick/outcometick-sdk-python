@@ -218,7 +218,15 @@ class DataClient:
             raise ValueError("download needs a file row, or a date and a name")
 
         path = f"/v1/dl/{urllib.parse.quote(str(date))}/{urllib.parse.quote(str(name))}"
-        res, url = self._request(path)
+        payload, expected = self._download_via(path, None, expected, f"{date}/{name}", verify, save_to)
+        return {"bytes": payload, "sha256": expected, "name": name, "date": date}
+
+    def _download_via(self, path, query, expected, label, verify=True, save_to=None):
+        """GET a route that answers 302 to a signed URL, fetch, verify.
+
+        Shared by the archive and smart-money downloads.
+        """
+        res, url = self._request(path, query=query)
 
         status = getattr(res, "status", None) or getattr(res, "code", None)
         if status and 300 <= status < 400:
@@ -243,7 +251,7 @@ class DataClient:
             got = hashlib.sha256(payload).hexdigest()
             if got != expected:
                 raise ValueError(
-                    f"checksum mismatch for {date}/{name}\n"
+                    f"checksum mismatch for {label}\n"
                     f"  expected {expected}\n  got      {got}"
                 )
 
@@ -251,7 +259,35 @@ class DataClient:
             with open(save_to, "wb") as fh:
                 fh.write(payload)
 
-        return {"bytes": payload, "sha256": expected, "name": name, "date": date}
+        return payload, expected
+
+    # -- smart money --------------------------------------------------------
+    #
+    # A separate subscription with its OWN key (a data key gets 403 here, and a
+    # smart-money key gets 403 on everything above). Daily files of the trades
+    # made by the top-ranked Polymarket traders: list ``top100``, or
+    # ``top1000`` on the Top 1000 plan. Until it is on sale these answer 503.
+
+    def smart_days(self):
+        """The days this smart-money key may download, newest first, with each list's status."""
+        return self._json("/v1/smart/days")
+
+    def smart_download(self, day, list_="top100", verify=True, save_to=None):
+        """Download one day's smart-money file (a zstd-compressed CSV).
+
+        Verified against the sha256 the server sends with the redirect.
+
+        :param day:   ``YYYY-MM-DD`` -- take it from :meth:`smart_days`
+        :param list_: ``top100`` | ``top1000``
+        """
+        if not day:
+            raise ValueError("smart_download needs a day")
+        if list_ not in ("top100", "top1000"):
+            raise ValueError("list_ must be 'top100' or 'top1000'")
+        payload, expected = self._download_via(
+            "/v1/smart/download", {"day": day, "list": list_}, None, f"{day}/{list_}", verify, save_to,
+        )
+        return {"bytes": payload, "sha256": expected, "day": day, "list": list_}
 
     # -- public, no key needed --------------------------------------------
 
@@ -262,6 +298,14 @@ class DataClient:
     def plans(self):
         """Plans and live prices. Public."""
         return self._json("/v1/public/plans", auth=False)
+
+    def smart_coverage(self):
+        """How many smart-money days are published, and from when. Public."""
+        return self._json("/v1/public/smart-coverage", auth=False)
+
+    def smart_plans(self):
+        """Smart-money plans and prices (USD), and whether it is on sale. Public."""
+        return self._json("/v1/public/smart-plans", auth=False)
 
     def health(self):
         """Liveness. Public."""

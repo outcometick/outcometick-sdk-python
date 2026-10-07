@@ -38,6 +38,9 @@ FILE_ROW = {
     "sha256": SHA,
 }
 
+# The checksum the smart-money redirect announces (a list so a test can swap it).
+SMART_SHA = [None]
+
 # Per-test overrides: {path: (status, body_or_bytes)}
 OVERRIDES: dict = {}
 SEEN: list = []
@@ -101,6 +104,13 @@ class Handler(BaseHTTPRequestHandler):
                 "url": "http://x/signed", "name": FILE_ROW["name"],
                 "bytes": len(PAYLOAD), "sha256": SHA, "expiresInSec": 900,
             })
+        if u.path == "/v1/smart/download":
+            self.send_response(302)
+            self.send_header("location", f"http://127.0.0.1:{self.server.server_port}/signed-bytes")
+            self.send_header("x-outcometick-sha256", SMART_SHA[0])
+            self.send_header("content-length", "0")
+            self.end_headers()
+            return None
         if u.path.startswith("/v1/dl/"):
             # Exactly what the real route does.
             self.send_response(302)
@@ -265,6 +275,46 @@ class TestDownload(ClientTestCase):
         s = self.ot.sign_url("2026-08-12", FILE_ROW["name"], expires_in=300)
         self.assertEqual(s["sha256"], SHA)
         self.assertEqual(SEEN[-1]["query"]["expiresIn"], "300")
+
+
+class TestSmart(ClientTestCase):
+    def setUp(self):
+        super().setUp()
+        SMART_SHA[0] = SHA
+
+    def test_download_follows_verifies_and_never_sends_the_key_to_r2(self):
+        got = self.ot.smart_download("2026-10-08", "top1000")
+        self.assertEqual(got["bytes"], PAYLOAD)
+        self.assertEqual(got["sha256"], SHA)
+        self.assertEqual((got["day"], got["list"]), ("2026-10-08", "top1000"))
+        dl = [x for x in SEEN if x["path"] == "/v1/smart/download"][0]
+        self.assertEqual(dl["query"], {"day": "2026-10-08", "list": "top1000"})
+        self.assertEqual(dl["auth"], "Bearer ck_test")
+        self.assertEqual([x for x in SEEN if x["path"] == "/signed-bytes"][0]["auth"], None)
+
+    def test_checksum_mismatch_is_rejected(self):
+        SMART_SHA[0] = "0" * 64
+        with self.assertRaises(ValueError) as ctx:
+            self.ot.smart_download("2026-10-08")
+        self.assertIn("checksum mismatch for 2026-10-08/top100", str(ctx.exception))
+
+    def test_arguments_are_checked_before_calling_out(self):
+        with self.assertRaises(ValueError):
+            self.ot.smart_download("2026-10-08", "all")
+        with self.assertRaises(ValueError):
+            self.ot.smart_download(None)
+        self.assertEqual(SEEN, [])
+
+    def test_days_with_key_coverage_and_plans_public(self):
+        OVERRIDES["/v1/public/smart-coverage"] = (200, {"firstDay": "2026-10-08", "lastDay": "2026-10-09", "days": 2})
+        OVERRIDES["/v1/public/smart-plans"] = (200, {"onSale": False, "plans": []})
+        OVERRIDES["/v1/smart/days"] = (503, {"error": "smart-money is not on sale yet"})
+        self.assertEqual(self.ot.smart_coverage()["days"], 2)
+        self.assertEqual(SEEN[-1]["auth"], None)
+        self.assertEqual(self.ot.smart_plans(), {"onSale": False, "plans": []})
+        with self.assertRaises(OutcometickError) as ctx:
+            self.ot.smart_days()
+        self.assertEqual(ctx.exception.status, 503)
 
 
 class TestBaseUrl(ClientTestCase):

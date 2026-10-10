@@ -1,0 +1,227 @@
+{
+  "assets": [
+    "BTC",
+    "ETH",
+    "SOL",
+    "XRP",
+    "DOGE",
+    "BNB",
+    "HYPE",
+    "ZEC"
+  ],
+  "taxonomy_datasets": [
+    "prices",
+    "twap30s",
+    "twap60s",
+    "book",
+    "best_bid_ask",
+    "price_change",
+    "last_trade_price",
+    "markets",
+    "tick_size_change",
+    "orderbook",
+    "klines",
+    "other"
+  ],
+  "archive_datasets": {
+    "polymarket": {
+      "prices": [
+        "prices"
+      ],
+      "twap30s": [
+        "twap30s"
+      ],
+      "twap60s": [
+        "twap60s"
+      ],
+      "book": [
+        "book",
+        "price_change"
+      ],
+      "bbo": [
+        "best_bid_ask"
+      ],
+      "trades": [
+        "last_trade_price"
+      ],
+      "markets": [
+        "markets"
+      ]
+    },
+    "predict": {
+      "prices": [
+        "prices"
+      ],
+      "twap30s": [
+        "twap30s"
+      ],
+      "twap60s": [
+        "twap60s"
+      ],
+      "book": [
+        "orderbook"
+      ],
+      "trades": [
+        "last_trade_price"
+      ],
+      "markets": [
+        "markets"
+      ]
+    }
+  },
+  "always_fed": [
+    "markets"
+  ],
+  "capture_windows": {
+    "polymarket": {
+      "prices": {
+        "from": "2026-06-08",
+        "to": null
+      },
+      "twap30s": {
+        "from": "2026-08-07",
+        "to": null
+      },
+      "twap60s": {
+        "from": "2026-08-07",
+        "to": null
+      },
+      "book": {
+        "from": "2026-06-08",
+        "to": null
+      },
+      "bbo": {
+        "from": "2026-09-03",
+        "to": null
+      },
+      "trades": {
+        "from": "2026-06-08",
+        "to": null
+      },
+      "markets": {
+        "from": "2026-06-08",
+        "to": null
+      }
+    },
+    "predict": {
+      "prices": {
+        "from": "2026-06-13",
+        "to": null
+      },
+      "twap30s": {
+        "from": "2026-08-07",
+        "to": null
+      },
+      "twap60s": {
+        "from": "2026-08-07",
+        "to": null
+      },
+      "book": {
+        "from": "2026-06-13",
+        "to": null
+      },
+      "trades": {
+        "from": "2026-06-13",
+        "to": null
+      },
+      "markets": {
+        "from": "2026-06-13",
+        "to": null
+      }
+    }
+  },
+  "book_capture": {
+    "polymarket": [
+      {
+        "from": "2026-06-06",
+        "defaultMs": 500,
+        "perAsset": {}
+      },
+      {
+        "from": "2026-08-25",
+        "defaultMs": 500,
+        "perAsset": {
+          "BTC": 20,
+          "ETH": 100
+        }
+      }
+    ],
+    "predict": [
+      {
+        "from": "2026-06-12",
+        "defaultMs": 1000,
+        "perAsset": {}
+      },
+      {
+        "from": "2026-08-25",
+        "defaultMs": 0,
+        "perAsset": {}
+      }
+    ]
+  },
+  "derived_datasets": {
+    "twap60s:derived": {
+      "from": "prices",
+      "produces": "twap60s",
+      "lookbackSeconds": 60
+    },
+    "twap30s:derived": {
+      "from": "prices",
+      "produces": "twap30s",
+      "lookbackSeconds": 30
+    }
+  },
+  "degrading_datasets": [
+    "bbo"
+  ],
+  "market_intervals": [
+    "5m",
+    "15m"
+  ],
+  "default_intervals": [
+    "5m"
+  ],
+  "hook_names": {
+    "on_market_open": "on_market_open",
+    "on_tick": "on_tick",
+    "on_book": "on_book",
+    "on_trade": "on_trade",
+    "on_settle": "on_settle"
+  },
+  "known_hooks": [
+    "on_market_open",
+    "on_tick",
+    "on_book",
+    "on_trade",
+    "on_settle"
+  ],
+  "known_datasets": [
+    "settlement",
+    "prices",
+    "twap30s",
+    "twap60s",
+    "book",
+    "bbo",
+    "trades",
+    "markets"
+  ],
+  "max_latency_ms": 10000,
+  "max_fee_bps": 1000,
+  "limits": {
+    "maxFiles": 6,
+    "maxTotalSourceBytes": 262144,
+    "maxFileNameLength": 96,
+    "maxSeriesBytes": 4194304,
+    "maxSeriesCount": 4,
+    "perEventBudgetMicros": 400,
+    "logLineChars": 512,
+    "logBytesPerRun": 2097152,
+    "memoryBytes": 2147483648,
+    "vcpu": 1,
+    "replayBaseMs": 180000,
+    "fetchClockMs": 3600000,
+    "maxParams": 64,
+    "maxSweepCells": 256,
+    "archiveRetentionDays": 7
+  }
+}

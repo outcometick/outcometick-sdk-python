@@ -204,6 +204,12 @@ class TestDiscovery(ClientTestCase):
         self.assertEqual(q["asset"], "btc,eth")
         self.assertEqual(q["interval"], "5m,none")
 
+    def test_format_is_passed_through_and_omitted_when_not_asked(self):
+        self.ot.files(dataset="book", format="parquet")
+        self.assertEqual(SEEN[-1]["query"]["format"], "parquet")
+        self.ot.files(dataset="book")
+        self.assertNotIn("format", SEEN[-1]["query"])
+
     def test_empty_filters_are_omitted(self):
         self.ot.files(asset=[], dataset=None, date="2026-08-12")
         self.assertEqual(list(SEEN[-1]["query"]), ["date"])

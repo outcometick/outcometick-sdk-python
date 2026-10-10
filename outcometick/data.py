@@ -152,7 +152,7 @@ class DataClient:
         return self._json("/v1/mirror/days")
 
     def files(self, date=None, from_=None, to=None, venue=None, dataset=None,
-              asset=None, interval=None):
+              asset=None, interval=None, format=None):
         """Search for files across a date range.
 
         :param date:     one day -- sugar for ``from_ == to``. Not combinable
@@ -183,6 +183,8 @@ class DataClient:
         return self._json("/v1/files", {
             "date": date, "from": from_, "to": to,
             "venue": venue, "dataset": dataset, "asset": asset, "interval": interval,
+            # "parquet" lists the Parquet copy of each file instead; None = the .gz archive files.
+            "format": format,
         })
 
     # -- download ---------------------------------------------------------

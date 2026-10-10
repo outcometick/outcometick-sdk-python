@@ -290,7 +290,7 @@ def slippage(fills):
     cost = unfilled_size = requested_size = 0
     slips = []
     for f in fills:
-        if f.get("action") != "open":
+        if f.get("action") != "open" or f.get("liquidity") == "maker":
             continue
         orders += 1
         if f["filled"] > 0 and f["levels_walked"] == 1:
@@ -328,8 +328,107 @@ def slippage(fills):
     }
 
 
+MARKOUT_KEYS = (("1s", "markout_1s"), ("10s", "markout_10s"), ("60s", "markout_60s"),
+                ("settle", "markout_settle"))
+
+
+class MakerFillAccumulator:
+    """makerFillAccumulator in runner/engine/report.mjs."""
+
+    def __init__(self):
+        self.join, self.at_fill, self.in_queue = [], [], []
+        self.fills = 0
+        self.size = 0
+        self.mk = {k: {"sum": 0, "size": 0, "n": 0} for k, _ in MARKOUT_KEYS}
+
+    def add(self, f):
+        if f.get("liquidity") != "maker" or not f["filled"] > 0:
+            return
+        self.fills += 1
+        self.size += f["filled"]
+        if _finite(f.get("queue_ahead_at_join")):
+            self.join.append(f["queue_ahead_at_join"])
+        if _finite(f.get("queue_ahead_at_fill")):
+            self.at_fill.append(f["queue_ahead_at_fill"])
+        if _finite(f.get("time_in_queue_ms")):
+            self.in_queue.append(f["time_in_queue_ms"])
+        for k, field in MARKOUT_KEYS:
+            v = f.get(field)
+            if not _finite(v):
+                continue
+            self.mk[k]["sum"] += v * f["filled"]
+            self.mk[k]["size"] += f["filled"]
+            self.mk[k]["n"] += 1
+
+    def result(self):
+        def median(xs):
+            if not xs:
+                return None
+            s = sorted(xs)
+            return s[min(len(s) - 1, math.floor(0.5 * len(s)))]
+        return {
+            "fills": self.fills,
+            "size": self.size,
+            "median_ahead_at_join": median(self.join),
+            "median_ahead_at_fill": median(self.at_fill),
+            "median_time_in_queue_ms": median(self.in_queue),
+            "markout": {k: {
+                "mean": self.mk[k]["sum"] / self.mk[k]["size"] if self.mk[k]["size"] > 0 else None,
+                "fills": self.mk[k]["n"],
+                "size": self.mk[k]["size"],
+            } for k, _ in MARKOUT_KEYS},
+        }
+
+
 def fill_stats(fills):
-    return {"count": len(fills), "slippage": slippage(fills)}
+    maker = MakerFillAccumulator()
+    for f in fills:
+        maker.add(f)
+    return {"count": len(fills), "slippage": slippage(fills), "makerFills": maker.result()}
+
+
+def maker_report(*, stats, fills, queue_model, print_lag_ms):
+    """makerReport in runner/engine/report.mjs."""
+    if not stats or not stats.get("submitted", 0) > 0:
+        return None
+
+    def rate(a, b):
+        return r4(a / b) if b > 0 else None
+    f = fills if fills is not None else MakerFillAccumulator().result()
+    s = stats
+    return {
+        "queue_model": queue_model,
+        "print_lag_ms": print_lag_ms,
+        "orders": {
+            "submitted": s["submitted"],
+            "rested": s["rested"],
+            "with_maker_fill": s["orders_with_maker_fill"],
+            "fully_filled": s["fully_filled"],
+            "cancelled": s["cancelled"],
+            "cancelled_before_entry": s["cancelled_before_entry"],
+            "cancelled_no_position": s["cancelled_no_position"],
+            "expired": s["expired"],
+            "rejected_invalid": s["rejected_invalid"],
+            "rejected_post_only": s["rejected_post_only"],
+            "rejected_self_cross": s["rejected_self_cross"],
+            "rejected_duplicate_id": s["rejected_duplicate_id"],
+        },
+        "size": {
+            "rested": r2(s["rested_size"]),
+            "maker_filled": r2(s["maker_filled_size"]),
+            "taker_on_arrival": r2(s["taker_on_arrival_size"]),
+        },
+        "fill_rate_size": rate(s["maker_filled_size"], s["rested_size"]),
+        "fill_rate_orders": rate(s["orders_with_maker_fill"], s["rested"]),
+        "maker_fills": f["fills"],
+        "median_ahead_at_join": r2(f["median_ahead_at_join"]),
+        "median_ahead_at_fill": r2(f["median_ahead_at_fill"]),
+        "median_time_in_queue_ms": f["median_time_in_queue_ms"],
+        "markout": {k: {"mean": r4(m["mean"]), "fills": m["fills"], "size": r2(m["size"])}
+                    for k, m in f["markout"].items()},
+        "lag_suppressed_size": r2(s["lag_suppressed_size"]),
+        "crossed_observations": s["crossed_observations"],
+    }
 
 
 def split_by_market(trades, market_meta):
@@ -376,7 +475,7 @@ def fee_model_report(*, policy, markets):
 
 def build_report(*, run_id, submitted_at, manifest, scope, source_sha256=None, trades, fill_summary,
                  market_summaries, market_meta, fees_paid=0, fill_delay_ms=0, fee_model=None, sweep=None,
-                 coverage=None, crosschecks=(), budget=None, seed=None, scanned=None):
+                 coverage=None, crosschecks=(), budget=None, seed=None, scanned=None, maker=None):
     closed = [t for t in trades if _finite(t.get("pnl"))]
     equity = equity_curve(closed)
     matched = sum(1 for c in crosschecks if c.get("match"))
@@ -415,6 +514,7 @@ def build_report(*, run_id, submitted_at, manifest, scope, source_sha256=None, t
         "slippage": fill_summary["slippage"],
         "fill_delay_ms": fill_delay_ms,
         "fee_model": fee_model,
+        "maker": maker,
         "sweep": sweep,
         "coverage": coverage,
         "budget": budget,
@@ -494,6 +594,15 @@ def parse_fill(raw):
         "fee": raw["fee"] if _finite(raw.get("fee")) else 0,
         "realised": raw["realised"] if _finite(raw.get("realised")) else 0,
         "tag": _js_slice(tag, 64) if isinstance(tag, str) else None,
+        "liquidity": "maker" if raw.get("liquidity") == "maker" else "taker",
+        "order_id": _js_slice(raw["order_id"], 16) if isinstance(raw.get("order_id"), str) else None,
+        "queue_ahead_at_join": px(raw.get("queue_ahead_at_join")),
+        "queue_ahead_at_fill": px(raw.get("queue_ahead_at_fill")),
+        "time_in_queue_ms": px(raw.get("time_in_queue_ms")),
+        "markout_1s": px(raw.get("markout_1s")),
+        "markout_10s": px(raw.get("markout_10s")),
+        "markout_60s": px(raw.get("markout_60s")),
+        "markout_settle": px(raw.get("markout_settle")),
     }
 
 

@@ -109,3 +109,22 @@ class TestStrictNumbers(unittest.TestCase):
         self.assertEqual(Order(side='UP', size=2.5).size, 2.5)
         # floor(80 / 0.64) is 125 — the boundary where Python's `//` disagrees.
         self.assertEqual(Order(side='UP', notional=80, limit=0.64).size, 125)
+
+    def test_a_resting_order_needs_a_limit_and_takes_its_own_fields(self):
+        # Mirrors sdk-order.test.mjs: a gtc order rests AT a price.
+        o = Order(side='UP', size=10, limit=0.4, tif='gtc', post_only=True, client_id='q-1')
+        self.assertEqual((o.tif, o.post_only, o.client_id), ('gtc', True, 'q-1'))
+        self.assertEqual((Order(side='UP', size=10).post_only, Order(side='UP', size=10).client_id), (False, None))
+        bad = [
+            dict(size=10, tif='gtc'),                                  # no price to rest at
+            dict(size=10, limit=0.4, tif='gtc', hold_s=5),             # no single fill to time from
+            dict(size=10, limit=0.4, post_only=True),                  # gtc-only field on an ioc
+            dict(size=10, limit=0.4, client_id='a'),
+            dict(size=10, limit=0.4, tif='gtc', client_id='o7'),       # looks like an engine id
+            dict(size=10, limit=0.4, tif='gtc', client_id='x' * 65),
+            dict(size=10, limit=0.4, tif='gtc', client_id='bad id'),
+            dict(size=10, limit=0.4, tif='fok'),
+        ]
+        for kw in bad:
+            with self.assertRaises(ValueError, msg=f'{kw!r} was accepted'):
+                Order(side='UP', **kw)

@@ -154,6 +154,26 @@ def file_matches_run(file_path: str, *, venue: str, assets, archive_datasets, in
     return True
 
 
+def resting_policy_for(manifest, venue) -> dict:
+    """restingPolicyFor in api/lib/backtest-datasets.mjs, word for word."""
+    def refuse(refusal):
+        return {"allowed": False, "refusal": refusal, "cancelLatencyMs": 0}
+    if venue != "polymarket":
+        return refuse("resting (gtc) orders need a trade stream to advance the queue; "
+                      f"the {venue} archive has order-book snapshots only, so only ioc orders run there")
+    datasets = manifest.get("datasets") or []
+    missing = [d for d in ("book", "trades") if d not in datasets]
+    if missing:
+        names = " and ".join(f'"{d}"' for d in missing)
+        plural = len(missing) > 1
+        return refuse(f"resting (gtc) orders need the {names} dataset{'s' if plural else ''} — "
+                      f"add {'them' if plural else 'it'} to datasets in the manifest")
+    cancel = manifest.get("cancel_latency")
+    if cancel is None:
+        cancel = manifest.get("latency")
+    return {"allowed": True, "refusal": None, "cancelLatencyMs": cancel if cancel is not None else 0}
+
+
 def normalize_intervals(lst) -> list:
     if lst is None:
         return list(DEFAULT_INTERVALS)

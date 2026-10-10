@@ -13,7 +13,7 @@ import importlib.util
 import os
 import sys
 
-_NAMES = ("otengine", "otfeed", "otreplay", "otharness")
+_NAMES = ("otengine", "otfeed", "otmaker", "otreplay", "otharness")
 
 
 def _engine_dir() -> str:

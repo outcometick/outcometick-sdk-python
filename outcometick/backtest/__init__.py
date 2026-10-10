@@ -37,11 +37,11 @@ import sys
 import tempfile
 
 from ._contract import CONTRACT
-from .datasets import ManifestError, normalize_intervals
+from .datasets import ManifestError, normalize_intervals, resting_policy_for
 from .decode import BookThrottle, bbo_coverage, build_coverage, count_market_days, count_streams, sort_markets_for_replay
 from .feed import market_lines, session_lines
 from .local import archive_venues, default_venue, load_local_day, load_local_day_cached, local_days, looks_like_archive
-from .report import build_report, fee_model_report, fill_stats, parse_fill, parse_trade
+from .report import build_report, fee_model_report, fill_stats, maker_report, parse_fill, parse_trade
 from .sample import load_sample
 
 from ._engine import load as _load_engine
@@ -160,7 +160,7 @@ def _hooks_of(klass) -> list:
 
 def run(strategy, data, *, venue=None, assets=None, days=None, datasets=None, intervals=None,
         params=None, mode="market", latency_ms=0, fee_bps=None, seed=1, hooks=None,
-        cache=True) -> Result:
+        cancel_latency_ms=None, cache=True) -> Result:
     """Backtest `strategy` (a class) over an unpacked archive at `data`.
 
     assets    default BTC, ETH, SOL, XRP (as `ot run`); name others to include them.
@@ -168,6 +168,9 @@ def run(strategy, data, *, venue=None, assets=None, days=None, datasets=None, in
               when the class has on_trade. Add "bbo" for the top-of-book bound.
     intervals default ["5m"]; Polymarket has 5m and 15m.
     fee_bps   None = each market's venue schedule; a number = flat override.
+    cancel_latency_ms  how long ctx.cancel() takes to reach the venue (resting
+              orders); None = the same as latency_ms. Resting (gtc) orders need
+              datasets to include "book" and "trades", and Polymarket.
     cache     keep decoded days under ~/.cache/outcometick/decoded (or a path),
               so the next run over the same days starts at once. False: never.
     """
@@ -188,6 +191,7 @@ def run(strategy, data, *, venue=None, assets=None, days=None, datasets=None, in
         "datasets": list(datasets),
         "intervals": normalize_intervals(intervals),
         "latency": latency_ms or None,
+        "cancel_latency": cancel_latency_ms,
         "fee_bps": fee_bps,
         "mode": mode,
         "params": dict(params or getattr(strategy, "params", None) or {}),
@@ -241,6 +245,7 @@ def run_template(path, data, *, venue=None, assets=None, days=None, seed=1, fee_
         "datasets": list(doc.get("datasets") or []),
         "intervals": normalize_intervals(doc.get("intervals")),
         "latency": doc.get("latency"),
+        "cancel_latency": doc.get("cancel_latency"),
         "fee_bps": fee_bps if fee_bps is not None else doc.get("fee_bps"),
         "mode": doc.get("mode") or "market",
         "params": dict(doc.get("params") or {}),
@@ -267,12 +272,30 @@ def _validate(manifest) -> None:
                                 or not 0 < latency <= CONTRACT["max_latency_ms"]):
         raise BacktestError("E_MANIFEST", f"latency must be a whole number of milliseconds between 1 and "
                                           f"{CONTRACT['max_latency_ms']}, got {latency!r}")
+    cancel = manifest.get("cancel_latency")
+    if cancel is not None and (not isinstance(cancel, int) or isinstance(cancel, bool)
+                               or not 0 <= cancel <= CONTRACT["max_latency_ms"]):
+        raise BacktestError("E_MANIFEST", f"cancel_latency must be a whole number of milliseconds between 0 and "
+                                          f"{CONTRACT['max_latency_ms']}, got {cancel!r}")
     fee_bps = manifest.get("fee_bps")
     if fee_bps is not None and (not isinstance(fee_bps, (int, float)) or isinstance(fee_bps, bool)
                                 or not 0 <= fee_bps <= CONTRACT["max_fee_bps"]):
         raise BacktestError("E_MANIFEST", f"fee_bps must be between 0 and {CONTRACT['max_fee_bps']}, got {fee_bps!r}")
     if manifest["mode"] not in ("market", "session"):
         raise BacktestError("E_MANIFEST", f"unknown mode {manifest['mode']!r}; known: market, session")
+
+
+def _maker_stats(raw):
+    """parseMakerStats in runner/harness/protocol.mjs."""
+    if not isinstance(raw, dict):
+        return None
+    keys = _ENGINE["otmaker"].new_maker_stats()
+    out = {}
+    for k in keys:
+        v = raw.get(k)
+        ok = isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and v not in (float("inf"),) and v >= 0
+        out[k] = v if ok else 0
+    return out
 
 
 def _fee_policy(manifest) -> dict:
@@ -359,6 +382,7 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True) ->
             "mode": manifest["mode"],
             "seed": int(seed),
             "fees": fees,
+            "resting": resting_policy_for(manifest, venue),
             "limits": CONTRACT["limits"],
             "fillDelayMs": manifest.get("latency") or 0,
         }
@@ -406,6 +430,7 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True) ->
                 "stream": m.get("stream"),
             }
         delay = manifest.get("latency") or 0
+        summary = fill_stats(fills)
         report = build_report(
             run_id=f"local_{want_days[0]}",
             submitted_at=0,
@@ -421,7 +446,10 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True) ->
             },
             scanned={"markets": result["markets_run"], "market_days": market_days, "events": result["events_seen"]},
             trades=trades,
-            fill_summary=fill_stats(fills),
+            fill_summary=summary,
+            maker=maker_report(stats=result.get("maker"), fills=summary["makerFills"],
+                               queue_model=_ENGINE["otmaker"].QUEUE_MODEL,
+                               print_lag_ms=_ENGINE["otmaker"].PRINT_LAG_MS),
             market_summaries=list(meta.values()),
             market_meta=meta,
             fees_paid=result["fees_paid"],
@@ -492,6 +520,7 @@ def _parse_result(r: dict) -> dict:
         "events_seen": r["events_seen"] if fin(r.get("events_seen")) else 0,
         "fees_paid": r["fees_paid"] if fin(r.get("fees_paid")) else 0,
         "budget": r["budget"] if isinstance(r.get("budget"), dict) else None,
+        "maker": _maker_stats(r.get("maker")),
         "crosschecks": [{
             "market_id": c["market_id"] if isinstance(c.get("market_id"), str) else None,
             "claimed": c.get("claimed"),

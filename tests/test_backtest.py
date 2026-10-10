@@ -238,6 +238,17 @@ class Cases(unittest.TestCase):
         self.assertAlmostEqual(ra.fills[0]["avg_px"], 0.508, places=12)
         self.assertAlmostEqual(rb.fills[0]["avg_px"], (0.60 * 60 + 0.52 * 40) / 100, places=12)
 
+    def test_files_are_found_in_byte_order_like_node_readdir(self):
+        # The order files are found in decides a day's market order and the
+        # dropped-market list; Node's readdir is sorted, os.scandir is not.
+        from outcometick.backtest.local import walk
+
+        d = os.path.join(self.root, "w")
+        for name in ("b.jsonl", "a.jsonl", "C.jsonl", "_x.jsonl", "c.jsonl"):
+            os.makedirs(d, exist_ok=True)
+            open(os.path.join(d, name), "w").close()
+        self.assertEqual(walk(d), ["C.jsonl", "_x.jsonl", "a.jsonl", "b.jsonl", "c.jsonl"])
+
     def test_print_still_works_in_a_notebook(self):
         # The sandbox harness discards print(); the local runner must not.
         import io

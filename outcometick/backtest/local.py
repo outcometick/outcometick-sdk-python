@@ -40,7 +40,13 @@ def walk(root: str, prefix: str = "", depth: int = 0) -> list:
     if depth > 12:
         return out
     try:
-        entries = list(os.scandir(os.path.join(root, prefix) if prefix else root))
+        # SORTED BY BYTES, as Node's fs.readdir returns them (libuv sorts
+        # scandir results with strcmp). os.scandir is raw filesystem order, and
+        # the order files are found in decides the order of a day's markets and
+        # of the dropped-market list in the report: equal on one filesystem,
+        # different on another (CI caught it on ext4 vs the author's machine).
+        entries = sorted(os.scandir(os.path.join(root, prefix) if prefix else root),
+                         key=lambda e: os.fsencode(e.name))
     except OSError:
         return out
     for e in entries:

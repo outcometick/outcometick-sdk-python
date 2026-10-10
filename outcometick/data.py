@@ -266,7 +266,7 @@ class DataClient:
     # A separate subscription with its OWN key (a data key gets 403 here, and a
     # smart-money key gets 403 on everything above). Daily files of the trades
     # made by the top-ranked Polymarket traders: list ``top100``, or
-    # ``top1000`` on the Top 1000 plan. Until it is on sale these answer 503.
+    # ``top1000`` on the Top 1000 plan. While it is not on sale these answer 503.
 
     def smart_days(self):
         """The days this smart-money key may download, newest first, with each list's status."""

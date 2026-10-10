@@ -5,7 +5,7 @@
   scripts/publish-sdk-repos.mjs and overwritten wholesale on each publish.
   An edit made here survives until the next publish and then disappears.
 
-  Generated from monorepo revision 241418274f8c5ed7527dcb3dc96f28abc893b2e5.
+  Generated from monorepo revision 54d381c06862108cc51dcfa7c7b5278f8316f574.
 -->
 
 # outcometick
@@ -91,10 +91,10 @@ wire as `from`.
 reported separately under `filterTokens`, so code that builds an enum from it
 or parses the values as durations never meets a token.
 
-### Smart-money trade history (coming soon)
+### Smart-money trade history
 
 A separate subscription with its own key: daily files of the trades made by the
-top-ranked Polymarket traders. Until it is on sale these calls answer 503.
+top-ranked Polymarket traders.
 
 ```python
 import os

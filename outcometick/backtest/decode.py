@@ -102,6 +102,14 @@ def _fee_of(row):
     return {"model": FEE_MODEL_PM, "rate": rate}
 
 
+def _up_down_pair(ids):
+    """Exactly two distinct ids, as strings, or None (runner/events.mjs upDownPair)."""
+    if not isinstance(ids, list) or len(ids) != 2:
+        return None
+    up, down = js_string(ids[0]), js_string(ids[1])
+    return [up, down] if up != down else None
+
+
 def _polymarket_record(row):
     start, end = num(row.get("start_sec")), num(row.get("end_sec"))
     strike_raw = num(row.get("strike_value"))
@@ -116,7 +124,9 @@ def _polymarket_record(row):
         "open_ts_ms": None if start is None else start * 1000,
         "close_ts_ms": None if end is None else end * 1000,
         "stream": resolve_settlement_stream(row),
-        "token_ids": [js_string(t) for t in token_ids] if isinstance(token_ids, list) else [],
+        # None (not []) marks an unusable [Up, Down] pair — market_unusable drops
+        # it; Predict records keep []. Same rule as runner/events.mjs upDownPair.
+        "token_ids": _up_down_pair(token_ids),
         "fee": _fee_of(row),
         "raw": row,
     }
@@ -397,6 +407,10 @@ def market_unusable(market, in_window):
         return "no market metadata"
     if not market.get("asset"):
         return "market has no asset"
+    # Polymarket book/bbo/price_change/trade rows are attributed through
+    # token_ids; without a usable pair every one is dropped while ticks flow.
+    if "token_ids" in market and market["token_ids"] is None:
+        return "market has no usable [Up, Down] token ids"
     if market.get("stream") is None:
         return "settlement stream could not be resolved"
     if market.get("outcome") not in OUTCOMES:

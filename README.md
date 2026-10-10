@@ -5,7 +5,7 @@
   scripts/publish-sdk-repos.mjs and overwritten wholesale on each publish.
   An edit made here survives until the next publish and then disappears.
 
-  Generated from monorepo revision e172c5897ccff609f50bec450e97686635acd664.
+  Generated from monorepo revision b942565511c5117d9b37535a1247e3ec31905314.
 -->
 
 # outcometick
@@ -90,6 +90,31 @@ wire as `from`.
 `meta()["intervals"]` holds real durations only — the `none` sentinel is
 reported separately under `filterTokens`, so code that builds an enum from it
 or parses the values as durations never meets a token.
+
+### Rebuilding a Polymarket order book
+
+`book` and `price_change` are stored at a capture cadence, so a removal can
+fall between two stored frames and leave a stale level behind. `OrderBook`
+applies the documented rebuild rule: snapshots replace a token's
+ladder, changes set absolute sizes (0 removes), and levels crossed by the newest
+best bid/ask (from `best_bid_ask` and from each change) are dropped. Feed it
+rows from the three files merged by `recv_ms`.
+
+```python
+from outcometick.data import OrderBook
+
+book = OrderBook()
+for row in rows:
+    book.apply(row)        # dicts or JSONL lines
+book.ladder(token_id)      # {"bids": [{"price", "size"}], "asks": [...]}, best first
+book.best(token_id)        # {"bid": ..., "ask": ...}
+```
+
+That removes every level the best prices have moved past, but it cannot
+restore what the dropped frames added or resized: until the next snapshot a
+level, at the top too, can be missing or carry an old size (`best_bid_ask` has
+prices only). `best()` is the best level of the rebuilt ladder, not the
+market's latest best bid/ask — read `best_bid_ask` rows for that.
 
 ### Smart-money trade history
 

@@ -22,7 +22,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 
-from outcometick.data import DataClient, OutcometickError, NO_VALUE
+from outcometick.data import DataClient, OutcometickError, NO_VALUE, OrderBook
 
 PAYLOAD = gzip.compress(b"ts_ms,value\n1755000000000,65000\n")
 SHA = hashlib.sha256(PAYLOAD).hexdigest()
@@ -322,6 +322,98 @@ class TestBaseUrl(ClientTestCase):
         ot = DataClient(key="ck_test", base_url=self.base + "/")
         ot.meta()
         self.assertEqual(SEEN[0]["path"], "/v1/meta")
+
+
+# ---------- OrderBook (mirrors the OrderBook cases in client/data.test.mjs) ----------
+
+def book_row(asset_id, bids, asks, recv_ms=1):
+    return {"slug": "btc-updown-5m-1", "asset_id": asset_id, "event_type": "book", "event_ts_ms": recv_ms, "recv_ms": recv_ms,
+            "payload": {"event_type": "book", "asset_id": asset_id, "market": "0xm", "timestamp": str(recv_ms), "hash": "h",
+                        "bids": [{"price": p, "size": s} for p, s in bids], "asks": [{"price": p, "size": s} for p, s in asks]}}
+
+
+def change_row(items, recv_ms=2):
+    return {"slug": "btc-updown-5m-1", "asset_id": None, "event_type": "price_change", "event_ts_ms": recv_ms, "recv_ms": recv_ms,
+            "payload": {"event_type": "price_change", "market": "0xm", "timestamp": str(recv_ms),
+                        "price_changes": [{"asset_id": a, "side": sd, "price": p, "size": s, "hash": "h", "best_bid": bb, "best_ask": ba}
+                                          for a, sd, p, s, bb, ba in items]}}
+
+
+def bbo_row(asset_id, best_bid, best_ask, recv_ms=3):
+    return {"slug": "btc-updown-5m-1", "asset_id": asset_id, "event_type": "best_bid_ask", "event_ts_ms": recv_ms, "recv_ms": recv_ms,
+            "payload": {"event_type": "best_bid_ask", "asset_id": asset_id, "market": "0xm", "best_bid": best_bid,
+                        "best_ask": best_ask, "spread": "0.01", "timestamp": str(recv_ms)}}
+
+
+def flat(side):
+    return [[lvl["price"], lvl["size"]] for lvl in side]
+
+
+class TestOrderBook(unittest.TestCase):
+    def test_snapshot_sets_the_ladder_best_first_as_spelled(self):
+        b = OrderBook().apply(book_row("A", [["0.48", "5"], ["0.50", "10"], ["0.49", "0"]], [["0.53", "2"], ["0.52", "7"]]))
+        self.assertEqual(flat(b.ladder("A")["bids"]), [["0.50", "10"], ["0.48", "5"]])
+        self.assertEqual(flat(b.ladder("A")["asks"]), [["0.52", "7"], ["0.53", "2"]])
+        self.assertEqual(b.best("A"), {"bid": {"price": "0.50", "size": "10"}, "ask": {"price": "0.52", "size": "7"}})
+        self.assertEqual(b.assets(), ["A"])
+
+    def test_price_change_sets_absolute_sizes_and_zero_removes(self):
+        b = OrderBook().apply(book_row("A", [["0.50", "10"], ["0.48", "5"]], [["0.52", "7"]]))
+        b.apply(change_row([["A", "BUY", "0.5", "12", "0.5", "0.52"], ["A", "BUY", "0.48", "0", "0.5", "0.52"],
+                            ["A", "SELL", "0.55", "3", "0.5", "0.52"]]))
+        self.assertEqual(flat(b.ladder("A")["bids"]), [["0.5", "12"]])
+        self.assertEqual(flat(b.ladder("A")["asks"]), [["0.52", "7"], ["0.55", "3"]])
+
+    def test_ghost_from_missed_removal_is_pruned(self):
+        b = OrderBook().apply(book_row("A", [["0.50", "10"], ["0.49", "4"]], [["0.52", "7"], ["0.53", "1"]]))
+        b.apply(change_row([["A", "BUY", "0.47", "6", "0.49", "0.53"]]))
+        self.assertEqual(flat(b.ladder("A")["bids"]), [["0.49", "4"], ["0.47", "6"]])
+        self.assertEqual(flat(b.ladder("A")["asks"]), [["0.53", "1"]])
+
+    def test_best_bid_ask_prunes_only_and_never_adds(self):
+        b = OrderBook().apply(book_row("A", [["0.50", "10"], ["0.49", "4"]], [["0.52", "7"]]))
+        b.apply(bbo_row("A", "0.49", "0.51"))
+        self.assertEqual(flat(b.ladder("A")["bids"]), [["0.49", "4"]])
+        self.assertEqual(flat(b.ladder("A")["asks"]), [["0.52", "7"]])
+
+    def test_missing_or_out_of_range_best_prunes_nothing(self):
+        b = OrderBook().apply(book_row("A", [["0.50", "10"]], [["0.52", "7"]]))
+        b.apply(bbo_row("A", "", None))
+        b.apply(bbo_row("A", "1.5", "abc"))
+        b.apply(bbo_row("A", True, "-0.1"))
+        self.assertEqual(flat(b.ladder("A")["bids"]), [["0.50", "10"]])
+        self.assertEqual(flat(b.ladder("A")["asks"]), [["0.52", "7"]])
+
+    def test_blank_containers_and_non_decimal_spellings_are_not_numbers(self):
+        b = OrderBook().apply(book_row("A", [["0.50", "10"], ["0.49", "4"]], [["0.52", "7"]]))
+        for junk in [" ", [], {}, "0x0", "Infinity", "1e400", " 0.5", "1_0"]:
+            b.apply(bbo_row("A", junk, junk))
+        b.apply(change_row([["A", "BUY", "0.50", " ", "x", "x"], ["A", "BUY", " ", "0", "x", "x"], ["A", "SELL", "0.52", [], "x", "x"]]))
+        self.assertEqual(flat(b.ladder("A")["bids"]), [["0.50", "10"], ["0.49", "4"]])
+        self.assertEqual(flat(b.ladder("A")["asks"]), [["0.52", "7"]])
+        b.apply(bbo_row("A", "5e-1", 1))
+        self.assertEqual(flat(b.ladder("A")["bids"]), [["0.50", "10"], ["0.49", "4"]])
+
+    def test_tokens_kept_apart_each_pruned_by_its_own_last_item(self):
+        b = OrderBook().apply(book_row("A", [["0.50", "1"]], [])).apply(book_row("B", [["0.50", "2"]], []))
+        b.apply(change_row([["A", "BUY", "0.40", "1", "0.45", "0.6"], ["B", "BUY", "0.30", "1", "0.5", "0.6"]]))
+        self.assertEqual(flat(b.ladder("A")["bids"]), [["0.40", "1"]])
+        self.assertEqual(flat(b.ladder("B")["bids"]), [["0.50", "2"], ["0.30", "1"]])
+
+    def test_snapshot_replaces_whole_jsonl_legacy_and_other_types(self):
+        b = OrderBook().apply(json.dumps(book_row("A", [["0.50", "10"]], [["0.52", "7"]])))
+        b.apply({"asset_id": "A", "event_type": "price_change", "payload": {"changes": [{"side": "BUY", "price": "0.51", "size": "3"}]}})
+        self.assertEqual(flat(b.ladder("A")["bids"]), [["0.51", "3"], ["0.50", "10"]])
+        b.apply({"asset_id": "A", "event_type": "last_trade_price", "payload": {"price": "0.9", "size": "1"}})
+        b.apply(book_row("A", [["0.45", "1"]], []))
+        self.assertEqual(b.ladder("A"), {"bids": [{"price": "0.45", "size": "1"}], "asks": []})
+        self.assertEqual(OrderBook().ladder("nope"), {"bids": [], "asks": []})
+        self.assertEqual(OrderBook().best("nope"), {"bid": None, "ask": None})
+
+    def test_ladder_hands_out_copies(self):
+        b = OrderBook().apply(book_row("A", [["0.50", "10"]], []))
+        b.ladder("A")["bids"][0]["size"] = "999"
+        self.assertEqual(b.ladder("A")["bids"][0]["size"], "10")
 
 
 if __name__ == "__main__":

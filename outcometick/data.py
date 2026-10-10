@@ -25,12 +25,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
 
-__all__ = ("DataClient", "OutcometickError", "NO_VALUE", "DEFAULT_BASE_URL")
+__all__ = ("DataClient", "OrderBook", "OutcometickError", "NO_VALUE", "DEFAULT_BASE_URL")
 
 DEFAULT_BASE_URL = "https://outcometick.com"
 
@@ -322,3 +324,169 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+# ---------- rebuilding a Polymarket order book from archive rows ----------
+
+_NUMERIC = re.compile(r"[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?", re.ASCII)
+
+
+def _num(x):
+    """A finite float, or NaN. Only a finite number or a plain decimal string
+    ("0.5", "12", "1e-1") counts -- float() alone would take " 1 ", "1_0" and
+    "inf". Same rule as the JS client."""
+    if isinstance(x, bool):
+        return float("nan")
+    if isinstance(x, (int, float)) or (isinstance(x, str) and _NUMERIC.fullmatch(x)):
+        try:
+            n = float(x)
+        except OverflowError:  # an int too large for a float
+            return float("nan")
+        return n if math.isfinite(n) else float("nan")  # "1e400"
+    return float("nan")
+
+
+def _price_key(p):
+    """"0.50" and "0.5" are the same level."""
+    return repr(_num(p))
+
+
+def _ladder_side(side):
+    s = str(side if side is not None else "").upper()
+    return "bids" if s == "BUY" else "asks" if s == "SELL" else None
+
+
+def _prune_bound(x):
+    """A best price that can be pruned against: a number in [0, 1]."""
+    n = _num(x)
+    return n if n == n and 0 <= n <= 1 else None
+
+
+def _text(x):
+    """The archive's own spelling of a price or size (mirrors JS String())."""
+    if isinstance(x, str):
+        return x
+    if isinstance(x, float) and x.is_integer():
+        return str(int(x))
+    return str(x)
+
+
+class OrderBook:
+    """Rebuilds a Polymarket order book, per outcome token, from the archive's
+    ``book``, ``price_change`` and ``best_bid_ask`` rows fed in receipt order
+    (``recv_ms``; merge the three files by it)::
+
+        book = OrderBook()
+        for row in rows:
+            book.apply(row)
+        book.ladder(token_id)   # {"bids": [{"price", "size"}, ...], "asks": [...]}, best first
+
+    - ``book`` replaces that token's whole ladder.
+    - ``price_change`` sets each level to an absolute size; size 0 removes it.
+    - Then any bid above the best bid, or ask below the best ask, is dropped --
+      the best prices come from ``best_bid_ask`` and from the ``best_bid`` /
+      ``best_ask`` each ``price_change`` item carries.
+
+    Why the last step: book and price_change are captured at a cadence, so a
+    removal can fall between two stored frames and leave its level behind until
+    the next snapshot. Pruning against the newest best prices removes every
+    level they have moved past. It cannot restore what dropped frames added or
+    resized: until the next snapshot a level -- at the top too -- can be missing
+    or carry an old size, because best_bid_ask carries prices only. ``best()`` is
+    the best level of the rebuilt ladder, not the market's latest best bid and
+    ask; read best_bid_ask rows for those.
+
+    Prices and sizes are returned as the archive wrote them (strings). Rows of
+    other types are ignored. Predict.fun order-book rows are full snapshots on
+    their own and need none of this. Mirrors ``OrderBook`` in the JS client.
+    """
+
+    def __init__(self):
+        self._tokens = {}
+
+    def _ladders(self, asset_id):
+        if asset_id not in self._tokens:
+            self._tokens[asset_id] = {"bids": {}, "asks": {}}
+        return self._tokens[asset_id]
+
+    def _prune(self, asset_id, best_bid, best_ask):
+        lad = self._tokens.get(asset_id)
+        if lad is None:
+            return
+        bid = _prune_bound(best_bid)
+        ask = _prune_bound(best_ask)
+        if bid is not None:
+            for k in [k for k, lvl in lad["bids"].items() if _num(lvl["price"]) > bid]:
+                del lad["bids"][k]
+        if ask is not None:
+            for k in [k for k, lvl in lad["asks"].items() if _num(lvl["price"]) < ask]:
+                del lad["asks"][k]
+
+    def apply(self, row):
+        """Apply one archive row (a dict, or the JSONL line itself). Returns self."""
+        r = json.loads(row) if isinstance(row, str) else row
+        if not isinstance(r, dict):
+            return self
+        p = r.get("payload") if isinstance(r.get("payload"), dict) else {}
+        kind = r.get("event_type") if r.get("event_type") is not None else p.get("event_type")
+        row_asset = r.get("asset_id") if r.get("asset_id") is not None else p.get("asset_id")
+        if kind == "book":
+            if row_asset is None:
+                return self
+            lad = self._ladders(str(row_asset))
+            for side in ("bids", "asks"):
+                lad[side].clear()
+                levels = p.get(side) if isinstance(p.get(side), list) else []
+                for lvl in levels:
+                    if isinstance(lvl, list):
+                        price, size = (lvl + [None, None])[:2]
+                    elif isinstance(lvl, dict):
+                        price, size = lvl.get("price"), lvl.get("size")
+                    else:
+                        continue
+                    if _num(price) == _num(price) and _num(size) > 0:
+                        lad[side][_price_key(price)] = {"price": _text(price), "size": _text(size)}
+        elif kind == "price_change":
+            items = p.get("price_changes") if isinstance(p.get("price_changes"), list) else (
+                p.get("changes") if isinstance(p.get("changes"), list) else [])
+            bests = {}
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                asset = it.get("asset_id") if it.get("asset_id") is not None else row_asset
+                side = _ladder_side(it.get("side"))
+                size = _num(it.get("size"))
+                if asset is None or side is None or _num(it.get("price")) != _num(it.get("price")) or size != size:
+                    continue
+                lad = self._ladders(str(asset))
+                if size > 0:
+                    lad[side][_price_key(it["price"])] = {"price": _text(it["price"]), "size": _text(it["size"])}
+                else:
+                    lad[side].pop(_price_key(it["price"]), None)
+                bests.pop(str(asset), None)
+                bests[str(asset)] = it
+            for asset, it in bests.items():
+                self._prune(asset, it.get("best_bid"), it.get("best_ask"))
+        elif kind == "best_bid_ask":
+            if row_asset is not None:
+                self._prune(str(row_asset), p.get("best_bid"), p.get("best_ask"))
+        return self
+
+    def assets(self):
+        """Token ids seen so far."""
+        return list(self._tokens)
+
+    def ladder(self, asset_id):
+        """The token's ladder, best level first on each side."""
+        lad = self._tokens.get(str(asset_id))
+        if lad is None:
+            return {"bids": [], "asks": []}
+        return {
+            "bids": [dict(x) for x in sorted(lad["bids"].values(), key=lambda x: -_num(x["price"]))],
+            "asks": [dict(x) for x in sorted(lad["asks"].values(), key=lambda x: _num(x["price"]))],
+        }
+
+    def best(self, asset_id):
+        """The best bid and ask of the rebuilt ladder (None when that side is empty)."""
+        lad = self.ladder(asset_id)
+        return {"bid": lad["bids"][0] if lad["bids"] else None, "ask": lad["asks"][0] if lad["asks"] else None}

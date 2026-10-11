@@ -572,14 +572,19 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, wo
     events_dir = tempfile.mkdtemp(prefix="ot-events-")
     try:
         markets, missing, bbo_applied = [], [], {}
-        throttle = (None if book_throttle is False
-                    else BookThrottle(venue=venue, assets=scope_assets, frm=want_days[0], to=want_days[-1]))
         try:
             policy = engine_policy_for(manifest, venue, "archive")
         except ManifestError as err:
             raise BacktestError("E_MANIFEST", str(err)) from None
         run_inputs: list = []
         for day in want_days:
+            # A fresh throttle each day, as the hosted runner and `ot run` decode: the
+            # cadence comes from the whole range, but which rows a day keeps never
+            # depends on the day decoded before it (a market across midnight would
+            # otherwise lose its first rows after it -- and the cache, which keeps
+            # days one by one, would depend on which run wrote it).
+            throttle = (None if book_throttle is False
+                        else BookThrottle(venue=venue, assets=scope_assets, frm=want_days[0], to=want_days[-1]))
             kw = dict(root=root, day=day, venue=venue, assets=scope_assets, datasets=manifest["datasets"],
                       intervals=manifest["intervals"], throttle=throttle, book_factory=lambda: _Book(None),
                       workers=n_workers, ctx=fork_context())

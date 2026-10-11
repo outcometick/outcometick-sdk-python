@@ -612,6 +612,63 @@ class SizedSide(Strategy):
         return Order(side=ctx.p.side, size=ctx.p.size, limit=0.99)
 
 
+class PidSide(SizedSide):
+    """SizedSide that leaves a file named after the process each market ran on."""
+
+    def on_market_open(self, ctx, market):
+        super().on_market_open(ctx, market)
+        open(os.path.join(ctx.p.pids, str(os.getpid())), "w").close()
+
+
+class CountsCells(SizedSide):
+    """Counts its runs on the CLASS and sizes by the count: a sequential sweep
+    carries the count from cell to cell, so a parallel one has to as well."""
+    calls = 0
+
+    def on_market_open(self, ctx, market):
+        super().on_market_open(ctx, market)
+        if not getattr(self, "counted", False):
+            type(self).calls += 1
+            self.counted = True
+
+    def on_tick(self, ctx, tick):
+        if self.done:
+            return None
+        self.done = True
+        return Order(side=ctx.p.side, size=ctx.p.size + type(self).calls, limit=0.99)
+
+
+class FailsOn13(SizedSide):
+    def on_tick(self, ctx, tick):
+        if ctx.p.size == 13:
+            raise ValueError("thirteen")
+        return super().on_tick(ctx, tick)
+
+
+class HangsOn99(FailsOn13):
+    def on_tick(self, ctx, tick):
+        if ctx.p.size == 99:
+            import time
+            time.sleep(3600)
+        return super().on_tick(ctx, tick)
+
+
+class DiesOn77(SizedSide):
+    """On a forked cell with size 77: start a sleeper, then die without a word."""
+
+    def on_tick(self, ctx, tick):
+        if ctx.p.size == 77 and os.getpid() != ctx.p.parent:
+            if os.fork() == 0:
+                open(os.path.join(ctx.p.pids, str(os.getpid())), "w").close()
+                import time
+                time.sleep(3600)
+                os._exit(0)
+            import time
+            time.sleep(0.2)  # the sleeper has written its pid
+            os._exit(9)
+        return super().on_tick(ctx, tick)
+
+
 class Sweeps(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="ot-bt-sweep-")
@@ -646,6 +703,176 @@ class Sweeps(unittest.TestCase):
         self.assertEqual(vals, sorted(vals))
         self.assertIn("No days were held out", s.summary())
 
+    def test_parallel_cells_return_the_sequential_sweep(self):
+        grid = {"side": ["UP", "DOWN"], "size": [5, 10, 15]}
+        pids = tempfile.mkdtemp(prefix="ot-bt-pids-")
+        try:
+            seq = sweep(PidSide, self.root, grid, assets=["BTC"], holdout=0.5, top=3, params={"pids": pids})
+            parent = {str(os.getpid())}
+            self.assertEqual(set(os.listdir(pids)), parent)
+            par = sweep(PidSide, self.root, grid, assets=["BTC"], holdout=0.5, top=3, params={"pids": pids},
+                        cell_workers=3)
+            self.assertTrue(set(os.listdir(pids)) - parent, "no cell ran on another process")
+        finally:
+            shutil.rmtree(pids, ignore_errors=True)
+        self.assertEqual(seq.cells, par.cells)
+        self.assertEqual([c["params"] for c in seq.ranked], [c["params"] for c in par.ranked])
+
+    def test_state_left_on_the_class_makes_the_rest_of_the_sweep_sequential(self):
+        grid = {"size": [5, 6, 7, 8, 9]}
+        CountsCells.calls = 0
+        seq = sweep(CountsCells, self.root, grid, assets=["BTC"], params={"side": "UP"})
+        self.assertGreater(len({c["metrics"]["net_pnl"] for c in seq.cells}), 1)
+        seq_calls, CountsCells.calls = CountsCells.calls, 0
+        par = sweep(CountsCells, self.root, grid, assets=["BTC"], params={"side": "UP"}, cell_workers=4)
+        self.assertEqual(seq.cells, par.cells)
+        self.assertEqual(CountsCells.calls, seq_calls, "the parent did not carry the class state on")
+
+    def test_a_cell_that_fails_fails_the_parallel_sweep_the_same_way(self):
+        grid = {"size": [5, 6, 7, 13, 9]}
+        with self.assertRaises(BacktestError) as seq:
+            sweep(FailsOn13, self.root, grid, assets=["BTC"], params={"side": "UP"})
+        with self.assertRaises(BacktestError) as par:
+            sweep(FailsOn13, self.root, grid, assets=["BTC"], params={"side": "UP"}, cell_workers=3)
+        self.assertEqual((seq.exception.code, seq.exception.detail), (par.exception.code, par.exception.detail))
+
+    def test_a_failed_cell_stops_the_cells_still_running(self):
+        # Sequentially the sweep raises at 13 and never reaches 99, which would
+        # block forever; in parallel 99 is already running and must be killed.
+        import multiprocessing
+        import signal
+
+        def hung(*_):
+            for p in multiprocessing.active_children():  # or this test process would hang at exit too
+                p.kill()
+            # Not TimeoutError: that is an OSError, and multiprocessing's waitpid swallows those.
+            raise RuntimeError("sweep hung")
+        signal.signal(signal.SIGALRM, hung)
+        signal.alarm(30)
+        try:
+            with self.assertRaises(BacktestError) as cm:
+                sweep(HangsOn99, self.root, {"size": [5, 13, 99, 98]}, assets=["BTC"], params={"side": "UP"},
+                      cell_workers=3)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, signal.SIG_DFL)
+        self.assertIn("thirteen", cm.exception.detail)
+
+    def test_an_interrupt_while_waiting_kills_every_cell(self):
+        import multiprocessing
+        import signal
+        calls = []
+
+        def alarm(*_):
+            calls.append(1)
+            if len(calls) == 1:
+                signal.alarm(20)
+                raise KeyboardInterrupt  # Ctrl-C, while the parent waits on the sleeping cell
+            for p in multiprocessing.active_children():
+                p.kill()
+            raise RuntimeError("the interrupt did not end the sweep")
+        signal.signal(signal.SIGALRM, alarm)
+        signal.alarm(2)
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                sweep(HangsOn99, self.root, {"size": [5, 99, 98]}, assets=["BTC"], params={"side": "UP"},
+                      cell_workers=2)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, signal.SIG_DFL)
+        self.assertEqual(multiprocessing.active_children(), [])
+
+    def test_a_cell_that_dies_leaving_a_process_behind_is_rerun_here(self):
+        # The cell forks a sleeper and is killed (out of memory, say); the sleeper
+        # must not keep the sweep waiting, and must not outlive it.
+        pids = tempfile.mkdtemp(prefix="ot-bt-pids-")
+        import signal
+        signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(RuntimeError("sweep hung")))
+        signal.alarm(60)
+        try:
+            par = sweep(DiesOn77, self.root, {"size": [5, 77, 6]}, assets=["BTC"],
+                        params={"side": "UP", "parent": os.getpid(), "pids": pids}, cell_workers=3)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, signal.SIG_DFL)
+        seq = sweep(DiesOn77, self.root, {"size": [5, 77, 6]}, assets=["BTC"],
+                    params={"side": "UP", "parent": os.getpid(), "pids": pids})
+        self.assertEqual(par.cells, seq.cells)
+        sleepers = [int(p) for p in os.listdir(pids)]
+        shutil.rmtree(pids, ignore_errors=True)
+        self.assertTrue(sleepers, "the cell never forked")
+        for pid in sleepers:
+            for _ in range(100):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                import time
+                time.sleep(0.05)
+            else:
+                self.fail(f"process {pid} the dead cell started is still running")
+
+    def test_an_interrupt_just_after_fork_still_kills_and_reaps_the_cell(self):
+        import signal
+        real_fork, forked = os.fork, []
+
+        def fork():
+            pid = real_fork()
+            if pid:
+                forked.append(pid)
+                os.kill(os.getpid(), signal.SIGINT)  # Ctrl-C before the cell is registered
+            return pid
+        os.fork = fork
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                sweep(HangsOn99, self.root, {"size": [5, 99]}, assets=["BTC"], params={"side": "UP"},
+                      cell_workers=2)
+        finally:
+            os.fork = real_fork
+        self.assertEqual(len(forked), 1)
+        try:
+            with self.assertRaises(ChildProcessError):  # reaped already, by the sweep
+                os.waitpid(forked[0], os.WNOHANG)
+        except AssertionError:
+            for kill in (lambda: os.killpg(forked[0], signal.SIGKILL), lambda: os.kill(forked[0], signal.SIGKILL)):
+                try:
+                    kill()
+                except ProcessLookupError:
+                    pass
+            os.waitpid(forked[0], 0)
+            raise
+
+    def test_without_waitid_cells_run_here(self):
+        pids = tempfile.mkdtemp(prefix="ot-bt-pids-")
+        waitid = os.waitid
+        del os.waitid
+        try:
+            s = sweep(PidSide, self.root, {"size": [5, 10, 15]}, assets=["BTC"],
+                      params={"side": "UP", "pids": pids}, cell_workers=3)
+            self.assertEqual(os.listdir(pids), [str(os.getpid())])
+        finally:
+            os.waitid = waitid
+            shutil.rmtree(pids, ignore_errors=True)
+        self.assertEqual(len(s.cells), 3)
+
+    def test_no_forking_while_other_threads_run(self):
+        import threading
+        from outcometick.backtest import _parallel
+        pids = tempfile.mkdtemp(prefix="ot-bt-pids-")
+        stop = threading.Event()
+        holder = threading.Thread(target=lambda: (_parallel._STATE_LOCK.acquire(), stop.wait(),
+                                                  _parallel._STATE_LOCK.release()))
+        holder.start()
+        try:
+            s = sweep(PidSide, self.root, {"size": [5, 10, 15]}, assets=["BTC"],
+                      params={"side": "UP", "pids": pids}, cell_workers=3)
+            self.assertEqual(os.listdir(pids), [str(os.getpid())])
+        finally:
+            stop.set()
+            holder.join()
+            shutil.rmtree(pids, ignore_errors=True)
+        self.assertEqual(len(s.cells), 3)
+
     def test_bad_sweeps_are_refused(self):
         with self.assertRaises(BacktestError):
             sweep(SizedSide, self.root, {}, assets=["BTC"])
@@ -655,6 +882,9 @@ class Sweeps(unittest.TestCase):
             sweep(SizedSide, self.root, {"size": [5]}, assets=["BTC"], params={"side": "UP"}, holdout=0.99)
         with self.assertRaises(BacktestError):
             sweep(SizedSide, self.root, {"size": [5]}, assets=["BTC"], params={"side": "UP"}, metric="nope")
+        for bad in (0, 1.5, True, "2"):
+            with self.assertRaises(BacktestError):
+                sweep(SizedSide, self.root, {"size": [5]}, assets=["BTC"], params={"side": "UP"}, cell_workers=bad)
 
 
 class CountsMarkets(Strategy):
@@ -819,6 +1049,61 @@ def add_price_changes(root, rows, day="2026-09-08"):
 def price_change(ts, changes, slug="btc-updown-5m-m0"):
     return {"slug": slug, "asset_id": None, "event_type": "price_change", "event_ts_ms": ts, "recv_ms": ts,
             "payload": {"price_changes": changes}}
+
+
+class LogsBooks(Strategy):
+    def on_market_open(self, ctx, market):
+        ctx.log(f"open {market.market_id}")
+
+    def on_book(self, ctx, book):
+        ctx.log(f"book {ctx.now}")
+
+
+class DaysDecodeAlone(unittest.TestCase):
+    """A day decodes the same whatever day was decoded before it, as the hosted
+    runner and `ot run` decode it: the book throttle starts afresh each day. A
+    market across midnight has price changes 8 ms apart on either side of it,
+    inside BTC's 20 ms window -- carried over, the throttle would drop the second."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="ot-bt-days-")
+        self.cache = tempfile.mkdtemp(prefix="ot-bt-days-cache-")
+        T1 = T0 + 86_400_000  # noqa: N806
+        start = T1 - 150_000
+        up, down = "7" * 70, "8" * 70
+        raw = {"cryptoMarketConfig": {"twapLookbackSeconds": 60}, "feesEnabled": False}
+        row = {"slug": "btc-updown-5m-x", "asset": "btc", "interval_sec": 300, "condition_id": "0x" + "cd" * 32,
+               "token_ids": [up, down], "start_sec": start // 1000, "end_sec": start // 1000 + 300,
+               "resolved": True, "outcome_prices": ["1", "0"], "strike_value": "79104869058460346482688", "raw": raw}
+        change = lambda ts, px: price_change(ts, [{"asset_id": up, "side": "SELL", "price": px, "size": "10",  # noqa: E731
+                                                   "best_bid": "0.40", "best_ask": px}], slug="btc-updown-5m-x")
+        for day, t, rows in (("2026-09-08", start + 1000, [change(T1 - 5, "0.55")]),
+                             ("2026-09-09", T1 + 1000, [change(T1 + 3, "0.56")])):
+            _write(self.root, f"data/polymarket/daily/markets/BTC-5m/BTC-5m-markets-{day}.jsonl.gz", [row])
+            _write(self.root, f"data/polymarket/daily/book/BTC-5m/BTC-5m-book-{day}.jsonl.gz", [
+                {"slug": "btc-updown-5m-x", "asset_id": tok, "event_type": "book", "event_ts_ms": t, "recv_ms": t,
+                 "payload": {"asks": [{"price": "0.60", "size": "50"}], "bids": [{"price": "0.40", "size": "50"}]}}
+                for tok in (up, down)])
+            add_price_changes(self.root, rows, day=day)
+            lo = max(start, T0 if day == "2026-09-08" else T1)
+            hi = min(start + 300_000, T1 if day == "2026-09-08" else T1 + 86_400_000)
+            _write(self.root, f"data/chainlink-twap-60s/daily/prices/BTCUSD/BTCUSD-twap60s-prices-{day}.csv.gz",
+                   [[ts, 79100, "0", ts, ts] for ts in range(lo + 10, hi, 10_000)],
+                   csv_header=["feed_ts_ms", "value", "full_accuracy_value", "server_ts_ms", "recv_ms"])
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+        shutil.rmtree(self.cache, ignore_errors=True)
+
+    def test_two_days_replay_as_each_day_alone(self):
+        one = run(LogsBooks, self.root, assets=["BTC"], days=["2026-09-08"], cache=False).logs
+        two = run(LogsBooks, self.root, assets=["BTC"], days=["2026-09-09"], cache=False).logs
+        self.assertIn(f"book {T0 + 86_400_000 + 3}", two)
+        both = run(LogsBooks, self.root, assets=["BTC"], days=["2026-09-08", "2026-09-09"], cache=False).logs
+        self.assertEqual(both, one + "\n" + two)
+        # And the cache holds each day as it decodes alone, whichever run wrote it.
+        run(LogsBooks, self.root, assets=["BTC"], days=["2026-09-08", "2026-09-09"], cache=self.cache)
+        self.assertEqual(run(LogsBooks, self.root, assets=["BTC"], days=["2026-09-09"], cache=self.cache).logs, two)
 
 
 class ParallelEdges(unittest.TestCase):

@@ -607,6 +607,9 @@ def cache_key(*, root, day, venue, assets, datasets, intervals, throttle, engine
         "throttle": ("off" if throttle is None
                      else {"per_asset": dict(sorted(throttle.per_asset.items())), "fallback": throttle.fallback}),
         "files": files,
+        # 2: each day decoded with its own throttle. Days cached before that were
+        # thinned with the previous day's state carried in; a new key retires them.
+        "format": 2,
     }
     return _hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:24]
 

@@ -677,3 +677,180 @@ class ConcurrentRuns(unittest.TestCase):
         finally:
             shutil.rmtree(a, ignore_errors=True)
             shutil.rmtree(b, ignore_errors=True)
+
+
+# --- generic data: any binary market, your own data -------------------------------
+
+G0 = 1_760_000_000_000
+
+
+def _gbook(market, token, t, bids, asks):
+    return {"event_type": "book", "market": market, "asset_id": token, "timestamp": str(t),
+            "bids": [{"price": str(p), "size": str(s)} for p, s in bids],
+            "asks": [{"price": str(p), "size": str(s)} for p, s in asks]}
+
+
+def _gamma(resolved=None):
+    g = {"conditionId": "0xg", "slug": "g", "question": "G?", "clobTokenIds": '["ty","tn"]',
+         "outcomes": '["Yes","No"]', "outcomePrices": '["0.5","0.5"]',
+         "feesEnabled": True, "feeSchedule": {"rate": 0.07, "exponent": 1}}
+    if resolved:
+        g.update(umaResolutionStatus="resolved", outcomePrices=resolved, umaEndDate="2025-10-09T09:00:00Z")
+    return g
+
+
+class BuyYesOnce(Strategy):
+    def on_market_open(self, ctx, market):
+        self.done = False
+        self.seen = sorted(market.keys()) if hasattr(market, "keys") else None
+
+    def on_book(self, ctx, ev):
+        if self.done:
+            return None
+        self.done = True
+        return Order(side="Yes", size=10, limit=0.6)
+
+
+class BuyNoOnce(Strategy):
+    def on_book(self, ctx, ev):
+        if ctx.position().size > 0:
+            return None
+        return Order(side="no", size=10, limit=0.6)
+
+
+class GenericData(unittest.TestCase):
+    from outcometick.backtest import Dataset
+
+    def frames(self):
+        return [
+            _gbook("0xg", "ty", G0, [(0.48, 100)], [(0.50, 60), (0.52, 40)]),
+            _gbook("0xg", "tn", G0, [(0.48, 100)], [(0.52, 100)]),
+            _gbook("0xg", "ty", G0 + 60_000, [(0.58, 100)], [(0.62, 100)]),
+        ]
+
+    def test_resolved_market_pays_at_its_resolution_time(self):
+        ds = self.Dataset.from_frames([_gamma('["1","0"]')], self.frames())
+        r = run(BuyYesOnce, ds, datasets=["book"])
+        (t,) = r.trades
+        # 10 @ 0.50; venue fee round5(10 x 0.07 x 0.5 x 0.5) = 0.175; pays $1 each.
+        self.assertEqual((t["how"], t["side"], t["label"], t["outcome"]), ("settled", "UP", "Yes", "UP"))
+        self.assertAlmostEqual(t["pnl"], 10 * 1 - 5 - 0.175, places=9)
+        self.assertEqual(t["closed_ms"], 1760000400000)  # 2025-10-09T09:00:00Z, after the data
+        self.assertEqual(r.report["data_kind"], "generic")
+        self.assertEqual(r.report["strategy_on_resolved"]["markets"], 1)
+
+    def test_unresolved_market_is_valued_at_the_external_mid(self):
+        ds = self.Dataset.from_frames([_gamma()], self.frames())
+        r = run(BuyYesOnce, ds, datasets=["book"])
+        (t,) = r.trades
+        # The last UP book is 0.58 / 0.62: mid 0.60, valued, not sold.
+        self.assertEqual(t["how"], "marked")
+        self.assertAlmostEqual(t["mark_px"], 0.60, places=12)
+        self.assertAlmostEqual(t["marked_pnl"], 10 * 0.60 - 5, places=9)
+        self.assertAlmostEqual(t["pnl"], 10 * 0.60 - 5 - 0.175, places=9)
+        self.assertEqual(t["mark_source"], "up_mid")
+        v = r.report["valuation"]
+        self.assertTrue(v["net_pnl_includes_marks"])
+        self.assertTrue(v["complete"])
+        self.assertEqual(v["marked_pnl"], 1.0)
+        self.assertEqual(v["realised_pnl"], -0.18)
+
+    def test_a_stale_mark_is_refused_and_the_leg_valued_at_zero(self):
+        ds = self.Dataset.from_frames([_gamma()], self.frames() + [
+            {"event_type": "last_trade_price", "market": "0xg", "asset_id": "tn", "price": "0.3", "size": "1",
+             "side": "BUY", "timestamp": str(G0 + 600_000)}])
+        r = run(BuyYesOnce, ds, datasets=["book"], mark_max_age_ms=1000)
+        (t,) = r.trades
+        # The last trade is fresh (1 - 0.3 = 0.7) but the books are 540 s old:
+        # each candidate is checked before the next, so the trade marks it.
+        self.assertEqual(t["mark_source"], "last_trade")
+        self.assertAlmostEqual(t["mark_px"], 0.7, places=12)
+        # Ten minutes on, the DOWN book is one-sided and the UP book is old: no fresh mark.
+        quiet = self.frames() + [_gbook("0xg", "tn", G0 + 600_000, [], [(0.52, 100)])]
+        r2 = run(BuyYesOnce, self.Dataset.from_frames([_gamma()], quiet), datasets=["book"], mark_max_age_ms=1000)
+        (z,) = r2.trades
+        self.assertIsNone(z["mark_px"])
+        self.assertEqual(z["mark_missing"], "stale")
+        self.assertFalse(r2.report["valuation"]["complete"])
+
+    def test_the_last_print_in_input_order_marks_when_no_book_can(self):
+        def tr(token, t):
+            return {"event_type": "last_trade_price", "market": "0xg", "asset_id": token, "price": "0.4",
+                    "size": "1", "side": "BUY", "timestamp": str(t)}
+        # Asks only: no two-sided quote, so the mark is the last public print.
+        frames = [_gbook("0xg", "ty", G0, [], [(0.50, 60)]), tr("ty", G0 + 5), tr("tn", G0 + 5)]
+        (t,) = run(BuyYesOnce, self.Dataset.from_frames([_gamma()], frames), datasets=["book"]).trades
+        self.assertEqual(t["mark_source"], "last_trade")
+        self.assertAlmostEqual(t["mark_px"], 0.6, places=12)   # the DOWN print came last: 1 - 0.4
+        frames = [_gbook("0xg", "ty", G0, [], [(0.50, 60)]), tr("tn", G0 + 5), tr("ty", G0 + 5)]
+        (t,) = run(BuyYesOnce, self.Dataset.from_frames([_gamma()], frames), datasets=["book"]).trades
+        self.assertAlmostEqual(t["mark_px"], 0.4, places=12)
+
+    def test_pmdata_single_book_is_mirrored_atomically(self):
+        l2 = [
+            {"market_slug": "g", "condition_id": "0xg", "timestamp": G0, "event_type": "book",
+             "bid_prices": [0.48], "bid_sizes": [100], "ask_prices": [0.50], "ask_sizes": [60],
+             "pc_price": None, "pc_side": None, "pc_size": None, "winning_outcome": None},
+            # A new UP bid at 0.49 is a new DOWN ask at 0.51, in the same step.
+            {"market_slug": "g", "condition_id": "0xg", "timestamp": G0 + 10, "event_type": "price_change",
+             "bid_prices": None, "bid_sizes": None, "ask_prices": None, "ask_sizes": None,
+             "pc_price": 0.49, "pc_side": "BUY", "pc_size": 30, "winning_outcome": None},
+            {"market_slug": "g", "condition_id": "0xg", "timestamp": G0 + 99_000, "event_type": "market_resolved",
+             "bid_prices": None, "bid_sizes": None, "ask_prices": None, "ask_sizes": None,
+             "pc_price": None, "pc_side": None, "pc_size": None, "winning_outcome": "No"},
+        ]
+        trades = [{"timestamp": G0 + 20, "outcome": "No", "price": 0.51, "size": 5, "side": "BUY"}]
+        r = run(BuyNoOnce, self.Dataset.from_pmdata(l2, trades, market=_gamma()), datasets=["book", "trades"])
+        fills = [f for f in r.fills if f["filled"] > 0]
+        # First book: DOWN ask = 1 - 0.48 = 0.52 x 100. After the delta: 0.51 x 30 in front.
+        self.assertEqual([(f["avg_px"], f["filled"]) for f in fills], [(0.52, 10)])
+        (t,) = r.trades
+        self.assertEqual((t["how"], t["side"], t["label"], t["outcome"]), ("settled", "DOWN", "No", "DOWN"))
+        self.assertEqual(t["closed_ms"], G0 + 99_000)
+
+    def test_pmdata_rows_of_another_market_refuse_the_market(self):
+        row = {"market_slug": "g", "condition_id": "0xg", "timestamp": G0, "event_type": "book",
+               "bid_prices": [0.48], "bid_sizes": [100], "ask_prices": [0.50], "ask_sizes": [60]}
+        for bad_l2, bad_trades in (
+            ([row, {**row, "condition_id": "0xother", "timestamp": G0 + 5}], None),
+            ([row, {**row, "market_slug": "other", "timestamp": G0 + 5}], None),
+            ([row], [{"condition_id": "0xother", "timestamp": G0 + 9, "outcome": "Yes", "price": 0.5, "size": 1, "side": "BUY"}]),
+        ):
+            with self.assertRaises(BacktestError) as cm:
+                run(BuyNoOnce, self.Dataset.from_pmdata(bad_l2, bad_trades, market=_gamma()), datasets=["book", "trades"])
+            self.assertIn("another market", str(cm.exception))
+        # A record with no slug, rows with no condition id: two slugs are still two markets.
+        bare = {"market_id": "0xg", "token_ids": ["ty", "tn"], "labels": ["Yes", "No"]}
+        slug_only = {k: v for k, v in row.items() if k != "condition_id"}
+        for bad_l2, bad_trades in (
+            ([slug_only, {**slug_only, "market_slug": "h", "timestamp": G0 + 5}], None),
+            ([slug_only], [{"market_slug": "h", "timestamp": G0 + 9, "outcome": "Yes", "price": 0.5, "size": 1, "side": "BUY"}]),
+        ):
+            with self.assertRaises(BacktestError) as cm:
+                run(BuyNoOnce, self.Dataset.from_pmdata(bad_l2, bad_trades, market=bare), datasets=["book", "trades"])
+            self.assertIn("another market", str(cm.exception))
+
+    def test_a_directory_and_from_frames_are_the_same_dataset(self):
+        root = tempfile.mkdtemp()
+        try:
+            with open(os.path.join(root, "markets.json"), "w") as fh:
+                json.dump([_gamma('["0","1"]')], fh)
+            with gzip.open(os.path.join(root, "f.jsonl.gz"), "wt") as fh:
+                for f in self.frames():
+                    fh.write(json.dumps(f) + "\n")
+            a = run(BuyYesOnce, root, datasets=["book"])
+            b = run(BuyYesOnce, self.Dataset.from_frames([_gamma('["0","1"]')], self.frames()), datasets=["book"])
+            self.assertEqual(a.trades, b.trades)
+            self.assertEqual(a.trades[0]["outcome"], "DOWN")
+            with self.assertRaises(BacktestError):
+                run(BuyYesOnce, root, datasets=["book"], days=["2025-10-09"])
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_a_label_the_market_does_not_have_stops_the_run(self):
+        class Wrong(Strategy):
+            def on_book(self, ctx, ev):
+                return Order(side="Maybe", size=1, limit=0.6)
+        with self.assertRaises(BacktestError) as cm:
+            run(Wrong, self.Dataset.from_frames([_gamma()], self.frames()), datasets=["book"])
+        self.assertIn('"Maybe"', str(cm.exception))

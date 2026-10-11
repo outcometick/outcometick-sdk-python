@@ -38,9 +38,15 @@ class TestOrder(unittest.TestCase):
     def test_limit_is_optional(self):
         self.assertIsNone(Order(side="DOWN", size=1).limit)
 
-    def test_rejects_a_side_that_is_not_an_outcome_token(self):
-        with self.assertRaises(ValueError):
-            Order(side="SIDEWAYS", size=100)
+    def test_rejects_a_side_that_is_not_a_name(self):
+        for bad in (None, "", "  ", 1, ["UP"]):
+            with self.assertRaises(ValueError):
+                Order(side=bad, size=100)
+
+    def test_accepts_an_outcome_label(self):
+        # Generic data: the runner checks the label against the market, and
+        # stops the run on one the market does not have.
+        self.assertEqual(Order(side="Yes", size=1).side, "Yes")
 
     def test_rejects_a_non_positive_size(self):
         for bad in (0, -1):

@@ -31,20 +31,35 @@ def _line_time(line: str, lags) -> float:
     return ts
 
 
+_SEQ = re.compile(r'"seq"\s*:\s*(-?\d+)', re.ASCII)
+
+
+def _line_seq(line: str) -> int:
+    m = _SEQ.search(line)
+    return int(m.group(1)) if m else 0
+
+
 def _dumps(obj) -> str:
     """JSON.stringify for the header objects this module writes."""
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
-def market_lines(markets, *, lines_of, header_of):
-    """market mode: a header with the line count, then the lines."""
+def market_lines(markets, *, lines_of, header_of, cursor_of=None):
+    """market mode: a header with the line count, then the lines.
+
+    A generic market (generic.py) is streamed through `cursor_of`, its count
+    known from decoding."""
     for m in markets:
+        if (m.get("market") or {}).get("kind") == "generic":
+            yield _dumps({**header_of(m), "n": m["n"]})
+            yield from cursor_of(m)
+            continue
         lines = lines_of(m)
         yield _dumps({**header_of(m), "n": len(lines)})
         yield from lines
 
 
-def session_lines(markets, *, lines_of, header_of):
+def session_lines(markets, *, lines_of, header_of, cursor_of=None):
     """session mode: every market merged into one time order.
 
     Ties at one millisecond: an opening first, then events in market order,
@@ -63,7 +78,26 @@ def session_lines(markets, *, lines_of, header_of):
             t, phase = c["times"][c["i"]], 1
         else:
             t, phase = c["close_at"], 2
-        heapq.heappush(heap, (t, phase, c["k"], id(c), c))
+        heapq.heappush(heap, (t, phase, 0, c["k"], id(c), c))
+
+    def push_generic(c):
+        """A generic market: streamed, `end` (phase 2) then `close` (phase 3);
+        events tie-break on the global input sequence. MUST MATCH
+        advanceGeneric in runner/session-feed.mjs."""
+        line = next(c["it"], None)
+        if line is not None:
+            t = _line_time(line, None)
+            if math.isfinite(t) and t > c["run"]:
+                c["run"] = t
+            c["line"] = line
+            c["t"], phase, s = c["run"], 1, _line_seq(line)
+        elif not c["end_sent"]:
+            c["line"] = None
+            c["t"], phase, s = max(c["end_at"], c["run"]), 2, 0
+        else:
+            c["line"] = None
+            c["t"], phase, s = max(c["close_at"], c["t"]), 3, 0
+        heapq.heappush(heap, (c["t"], phase, s, c["k"], id(c), c))
 
     nxt = 0
     while True:
@@ -73,6 +107,15 @@ def session_lines(markets, *, lines_of, header_of):
             m = markets[nxt]
             nxt += 1
             header = header_of(m)
+            if (m.get("market") or {}).get("kind") == "generic":
+                if cursor_of is None:
+                    raise ValueError("a generic market needs a streaming cursor (cursor_of)")
+                yield _dumps({"open": {"i": k, **header}})
+                mk = m["market"]
+                push_generic({"k": k, "generic": True, "it": iter(cursor_of(m)), "run": open_at(m),
+                              "end_at": mk["trade_until_ts_ms"], "close_at": mk["close_ts_ms"],
+                              "end_sent": False, "line": None, "t": 0})
+                continue
             lines = lines_of(m)
             lags = header.get("lags")
             times = []
@@ -92,7 +135,18 @@ def session_lines(markets, *, lines_of, header_of):
             continue
         if top is None:
             break
-        _, phase, k, _, c = heapq.heappop(heap)
+        _, phase, _, k, _, c = heapq.heappop(heap)
+        if c.get("generic"):
+            if phase == 1:
+                yield '{"i":%d,"e":%s}' % (k, c["line"])
+            elif phase == 2:
+                yield '{"end":%d}' % k
+                c["end_sent"] = True
+            else:
+                yield '{"close":%d}' % k
+                continue
+            push_generic(c)
+            continue
         if phase == 2:
             yield '{"close":%d}' % k
             continue

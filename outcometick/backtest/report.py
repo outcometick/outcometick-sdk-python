@@ -561,7 +561,28 @@ def parse_trade(raw):
     # `outcome: undefined` in the JS: the key is absent once serialised.
     if raw.get("outcome") in OUTCOMES:
         row["outcome"] = raw["outcome"]
+    if isinstance(raw.get("label"), str):
+        row.update(_generic_trade_fields(raw))
     return row
+
+
+def _num_or_none(v):
+    return v if _finite(v) else None
+
+
+def _generic_trade_fields(raw):
+    """A generic market's extra trade fields. MUST MATCH genericTradeFields in protocol.mjs."""
+    mp = raw.get("mark_px")
+    return {
+        "label": _js_slice(raw["label"], 200),
+        "mark_px": None if mp is None else (mp if _finite(mp) and 0 <= mp <= 1 else None),
+        "marked_size": _num_or_none(raw.get("marked_size")),
+        "marked_pnl": _num_or_none(raw.get("marked_pnl")),
+        "mark_source": raw.get("mark_source") if raw.get("mark_source") in ("up_mid", "down_mid", "last_trade") else None,
+        "mark_ts_ms": _num_or_none(raw.get("mark_ts_ms")),
+        "mark_age_ms": _num_or_none(raw.get("mark_age_ms")),
+        "mark_missing": raw.get("mark_missing") if raw.get("mark_missing") in ("no_quote", "stale") else None,
+    }
 
 
 def parse_fill(raw):
@@ -603,6 +624,7 @@ def parse_fill(raw):
         "markout_10s": px(raw.get("markout_10s")),
         "markout_60s": px(raw.get("markout_60s")),
         "markout_settle": px(raw.get("markout_settle")),
+        **({"label": _js_slice(raw["label"], 200)} if isinstance(raw.get("label"), str) else {}),
     }
 
 

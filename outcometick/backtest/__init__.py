@@ -43,6 +43,8 @@ from .feed import _dumps as _feed_dumps, market_lines, session_lines
 from ._parallel import SharedState, default_workers, fork_context, replay_markets
 from .local import archive_venues, default_venue, load_local_day, load_local_day_cached, local_days, looks_like_archive
 from .report import build_report, fee_model_report, fill_stats, maker_report, parse_fill, parse_trade
+from .generic import Dataset, DatasetError, looks_like_generic_dataset
+from .generic_report import apply_generic_extras, generic_report_extras
 from .sample import load_sample
 from .sweep import SweepResult, sweep
 
@@ -55,7 +57,7 @@ _H = _ENGINE["otharness"]
 CHANNEL_FILL, CHANNEL_LOG, CHANNEL_PROGRESS = _H.CHANNEL_FILL, _H.CHANNEL_LOG, _H.CHANNEL_PROGRESS
 CHANNEL_RESULT, CHANNEL_TRADE, EXIT_OK, run_job = _H.CHANNEL_RESULT, _H.CHANNEL_TRADE, _H.EXIT_OK, _H.run_job
 
-__all__ = ["run", "run_template", "sweep", "load_sample", "Result", "SweepResult", "BacktestError"]
+__all__ = ["run", "run_template", "sweep", "load_sample", "Result", "SweepResult", "BacktestError", "Dataset"]
 
 HOOKS = ("on_market_open", "on_tick", "on_book", "on_trade", "on_settle")
 _EMITTING = ("on_tick", "on_book", "on_trade")
@@ -162,8 +164,16 @@ def _hooks_of(klass) -> list:
 
 def run(strategy, data, *, venue=None, assets=None, days=None, datasets=None, intervals=None,
         params=None, mode="market", latency_ms=0, fee_bps=None, seed=1, hooks=None,
-        cancel_latency_ms=None, cache=True, workers=None) -> Result:
-    """Backtest `strategy` (a class) over an unpacked archive at `data`.
+        cancel_latency_ms=None, cache=True, workers=None, mark_max_age_ms=None) -> Result:
+    """Backtest `strategy` (a class) over an unpacked archive at `data` -- or
+    over your own data for ANY Polymarket binary market: a `Dataset`, or a
+    directory with markets.json / markets.jsonl and CLOB frame files.
+
+    Generic data: every market in it is replayed (no assets / days / intervals);
+    datasets are what the frames hold. A resolved market pays at its resolution
+    time; an unresolved one is valued at the external mid (else last public
+    trade) when trading ends -- `mark_max_age_ms` refuses older marks (a leg
+    with no usable mark is valued at 0, and the report says so).
 
     assets    default BTC, ETH, SOL, XRP (as `ot run`); name others to include them.
     datasets  default: settlement and book (so orders can fill), plus trades
@@ -205,7 +215,7 @@ def run(strategy, data, *, venue=None, assets=None, days=None, datasets=None, in
         "params": dict(params or getattr(strategy, "params", None) or {}),
     }
     return _run(manifest, lambda: strategy, data=data, venue=venue, assets=assets, days=days, seed=seed, cache=cache,
-                workers=workers)
+                workers=workers, mark_max_age_ms=mark_max_age_ms)
 
 
 def run_template(path, data, *, venue=None, assets=None, days=None, seed=1, fee_bps=None, cache=True,
@@ -325,7 +335,17 @@ def _cache_root(cache):
     return os.path.join(base, "outcometick", "decoded")
 
 
-def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, workers=None) -> Result:
+def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, workers=None,
+         mark_max_age_ms=None) -> Result:
+    if mark_max_age_ms is not None and (not isinstance(mark_max_age_ms, int) or isinstance(mark_max_age_ms, bool)
+                                        or mark_max_age_ms < 0):
+        raise BacktestError("E_MANIFEST", f"mark_max_age_ms must be a whole number of milliseconds, got {mark_max_age_ms!r}")
+    if isinstance(data, Dataset) or looks_like_generic_dataset(os.fspath(data)):
+        return _run_generic(manifest, get_class, data=data, venue=venue, days=days, seed=seed, workers=workers,
+                            mark_max_age_ms=mark_max_age_ms)
+    if mark_max_age_ms is not None:
+        raise BacktestError("E_MANIFEST", "mark_max_age_ms applies to generic data only: archive markets settle "
+                                          "on their official outcome")
     root = os.fspath(data)
     if not looks_like_archive(root):
         raise BacktestError("E_DATA", f"{os.path.abspath(root)} does not look like an archive — "
@@ -502,6 +522,135 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, wo
             ),
             budget=result["budget"],
         )
+        return Result(report, trades, fills, logs)
+    finally:
+        shutil.rmtree(events_dir, ignore_errors=True)
+
+
+def _run_generic(manifest, get_class, *, data, venue, days, seed, workers, mark_max_age_ms) -> Result:
+    """Generic data (generic.py): the same replay and report as an archive run,
+    with the generic report fields. MUST MATCH the generic branch of
+    cli/commands/run.mjs."""
+    _validate(manifest)
+    if days:
+        raise BacktestError("E_DATA", "days= selects archive days; generic data has no days -- every market is replayed")
+    if venue not in (None, "polymarket"):
+        raise BacktestError("E_DATA", "generic data is Polymarket CLOB data; venue must be polymarket or None")
+    dataset = data if isinstance(data, Dataset) else Dataset.from_dir(os.fspath(data))
+    events_dir = tempfile.mkdtemp(prefix="ot-events-")
+    try:
+        try:
+            decoded = dataset.decode(events_dir=events_dir, book_factory=lambda: _Book(None),
+                                     mark_max_age_ms=mark_max_age_ms)
+        except DatasetError as err:
+            raise BacktestError("E_DATA", str(err)) from None
+        markets = decoded["markets"]
+        if not markets:
+            first = decoded["unusable"][0] if decoded["unusable"] else None
+            raise BacktestError("E_DATA", "no market of that dataset could be replayed"
+                                + (f" ({first['market_id']}: {first['why']})" if first else ""))
+        if manifest["mode"] == "session":
+            sort_markets_for_replay(markets, mode="session")
+        fees = _fee_policy(manifest)
+        job = {
+            "entry": manifest["entry"],
+            "hooks": {h: h for h in manifest["hooks"]},
+            "arities": {"on_market_open": 3, "on_tick": 3, "on_book": 3, "on_trade": 3, "on_settle": 4},
+            "params": manifest["params"],
+            "mode": manifest["mode"],
+            "seed": int(seed),
+            "fees": fees,
+            "resting": resting_policy_for(manifest, "polymarket"),
+            "limits": CONTRACT["limits"],
+            "fillDelayMs": manifest.get("latency") or 0,
+        }
+
+        def lines_of(m):
+            raise AssertionError("generic markets are streamed")
+
+        def cursor_of(m):
+            from .generic import file_lines
+            return file_lines(m["events_file"])
+
+        def header_of(m):
+            return {"market": m["market"], "stream": m["stream"], "terminal": m.get("terminal")}
+
+        stream = (session_lines if manifest["mode"] == "session" else market_lines)(
+            markets, lines_of=lines_of, header_of=header_of, cursor_of=cursor_of)
+        it = iter(stream)
+
+        def next_line():
+            return next(it, None)
+
+        out_lines = []
+
+        def emit(channel, payload):
+            out_lines.append((channel, payload))
+
+        def load_class():
+            klass = get_class()
+            for h in manifest["hooks"]:
+                if not callable(getattr(klass, h, None)):
+                    raise RunAbort("E_HOOK_SIG", f"{h} was declared but {h}() is not defined on the class")
+            return klass
+
+        code = run_job(job, load_class, next_line, emit)
+        trades, fills, logs, result, malformed = _demux(out_lines)
+        if code != EXIT_OK:
+            rej = result.get("rejection") or {"code": "E_RUNTIME", "detail": f"exited {code}"}
+            raise BacktestError(rej.get("code", "E_RUNTIME"), rej.get("detail", ""))
+        if result["markets_run"] < len(markets):
+            raise BacktestError("E_RUNTIME", f"only {result['markets_run']} of {len(markets)} market(s) were replayed")
+
+        meta = {}
+        for m in markets:
+            mk = m["market"]
+            meta[mk["market_id"]] = {
+                "market_id": mk["market_id"], "asset": mk.get("asset"), "interval": mk.get("interval"),
+                "outcome": mk.get("outcome"), "up_px": m.get("up_px"), "down_px": m.get("down_px"),
+                "stream": m.get("stream"),
+            }
+        delay = manifest.get("latency") or 0
+        summary = fill_stats(fills)
+        n = len(markets)
+        report = build_report(
+            run_id="local_generic",
+            submitted_at=0,
+            manifest={"schema": manifest["schema"], "language": manifest["language"], "mode": manifest["mode"]},
+            source_sha256=None,
+            scope={"venue": "polymarket", "assets": [], "from": None, "to": None,
+                   "market_days": n, "archived_day_count": n},
+            scanned={"markets": result["markets_run"], "market_days": n, "events": result["events_seen"]},
+            trades=trades,
+            fill_summary=summary,
+            maker=maker_report(stats=result.get("maker"), fills=summary["makerFills"],
+                               queue_model=_ENGINE["otmaker"].QUEUE_MODEL,
+                               print_lag_ms=_ENGINE["otmaker"].PRINT_LAG_MS),
+            market_summaries=list(meta.values()),
+            market_meta=meta,
+            fees_paid=result["fees_paid"],
+            fill_delay_ms=delay,
+            fee_model=fee_model_report(policy=fees, markets=[m["market"] for m in markets]),
+            sweep=None,
+            crosschecks=result["crosschecks"],
+            seed=int(seed),
+            coverage=build_coverage(
+                market_days_requested=None,
+                market_days_scanned=n,
+                markets_reported_by_runner=result["markets_run"],
+                missing=[],
+                reference_declared=[],
+                streams=count_streams(list(meta.values())),
+                dropped_rows=malformed,
+                **{k: v for k, v in bbo_coverage(venue="polymarket", datasets=manifest["datasets"], markets=markets,
+                                                 applied={}).items()},
+                local=True,
+                source=os.path.abspath(dataset.root) if dataset.root else None,
+            ),
+            budget=result["budget"],
+        )
+        report = apply_generic_extras(report, generic_report_extras(
+            trades=trades, markets=markets, unusable=decoded["unusable"], counts=decoded["counts"]))
         return Result(report, trades, fills, logs)
     finally:
         shutil.rmtree(events_dir, ignore_errors=True)

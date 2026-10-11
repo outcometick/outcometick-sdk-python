@@ -473,9 +473,47 @@ def fee_model_report(*, policy, markets):
     }
 
 
+def orders_report(*, policy, stats):
+    """MUST MATCH ordersReport in runner/engine/report.mjs."""
+    if not policy or (not policy.get("fok") and not policy.get("order_rules") and policy.get("maker_rebate") is None
+                      and not policy.get("quote_guard") and not policy.get("mirror_depth")):
+        return None
+    rules = policy.get("order_rules")
+    if rules is None:
+        rules_out = None
+    elif rules.get("mode") == "assumed":
+        rules_out = {
+            "mode": "assumed", "assumed_tick": rules["tick"], "assumed_min_size": rules["min_size"],
+            "size_step": rules["size_step"],
+            "note": "archive markets do not carry their tick or minimum size: these are values measured on the archive, "
+                    "not read per market \u2014 a market quoting in 0.01 would accept a 0.001 limit, one quoting finer "
+                    "would refuse it",
+        }
+    else:
+        rules_out = {"mode": "venue", "size_step": 0.01, "note": "tick and minimum size read from each market"}
+    rebate = policy.get("maker_rebate")
+    return {
+        "fok": bool(policy.get("fok")),
+        "order_rules": rules_out,
+        "quote_guard": None if policy.get("quote_guard") is None else {
+            **policy["quote_guard"],
+            "applies_to": ("opening and exit taker orders" if policy["quote_guard"].get("include_exits")
+                           else "opening taker orders (exits are never blocked)"),
+        },
+        "mirror_depth": policy.get("mirror_depth"),
+        "maker_rebate": None if rebate is None else {
+            "rate": rebate,
+            "total": r2((stats or {}).get("rebates", 0)),
+            "note": "an estimate: the venue pays maker rebates from a daily pool, pro rata, not per fill",
+        },
+        "rejected": dict((stats or {}).get("rejected") or {}),
+    }
+
+
 def build_report(*, run_id, submitted_at, manifest, scope, source_sha256=None, trades, fill_summary,
                  market_summaries, market_meta, fees_paid=0, fill_delay_ms=0, fee_model=None, sweep=None,
-                 coverage=None, crosschecks=(), budget=None, seed=None, scanned=None, maker=None):
+                 coverage=None, crosschecks=(), budget=None, seed=None, scanned=None, maker=None, orders=None,
+                 timers=None):
     closed = [t for t in trades if _finite(t.get("pnl"))]
     equity = equity_curve(closed)
     matched = sum(1 for c in crosschecks if c.get("match"))
@@ -515,6 +553,8 @@ def build_report(*, run_id, submitted_at, manifest, scope, source_sha256=None, t
         "fill_delay_ms": fill_delay_ms,
         "fee_model": fee_model,
         "maker": maker,
+        **({"orders": orders} if orders else {}),
+        **({"timers": timers} if timers else {}),
         "sweep": sweep,
         "coverage": coverage,
         "budget": budget,
@@ -625,7 +665,14 @@ def parse_fill(raw):
         "markout_60s": px(raw.get("markout_60s")),
         "markout_settle": px(raw.get("markout_settle")),
         **({"label": _js_slice(raw["label"], 200)} if isinstance(raw.get("label"), str) else {}),
+        **({"reject_reason": raw["reject_reason"] if raw["reject_reason"] in REJECT_REASONS else None}
+           if "reject_reason" in raw else {}),
+        **({"rebate": raw["rebate"] if _finite(raw.get("rebate")) else 0} if "rebate" in raw else {}),
     }
+
+
+# MUST MATCH REJECT_REASONS in runner/harness/protocol.mjs.
+REJECT_REASONS = ("fok_unfilled", "quote_guard", "below_min_size", "size_step", "off_tick")
 
 
 def _js_slice(s: str, n: int) -> str:

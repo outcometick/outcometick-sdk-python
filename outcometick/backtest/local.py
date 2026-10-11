@@ -604,7 +604,8 @@ def cache_key(*, root, day, venue, assets, datasets, intervals, throttle, engine
         "assets": sorted(str(a).upper() for a in (assets or [])),
         "datasets": sorted(datasets or []),
         "intervals": sorted(intervals or []),
-        "throttle": {"per_asset": dict(sorted(throttle.per_asset.items())), "fallback": throttle.fallback},
+        "throttle": ("off" if throttle is None
+                     else {"per_asset": dict(sorted(throttle.per_asset.items())), "fallback": throttle.fallback}),
         "files": files,
     }
     return _hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:24]

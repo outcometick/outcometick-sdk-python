@@ -187,3 +187,137 @@ def normalize_intervals(lst) -> list:
         if iv not in out:
             out.append(iv)
     return _js_sorted(out)
+
+
+# --- execution options (phase 2a) -------------------------------------------
+# MUST MATCH the same functions in api/lib/backtest-datasets.mjs, message for
+# message: `ot check` / the API refuse with those words, and this package must
+# refuse the same manifests the same way.
+
+ASSUMED_ORDER_RULES = {"tick": 0.001, "min_size": 5, "size_step": 0.01}
+
+
+def _num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and v not in (float("inf"), float("-inf"))
+
+
+def _json(v) -> str:
+    import json
+    try:
+        return json.dumps(v, separators=(",", ":"), ensure_ascii=False)
+    except (TypeError, ValueError):
+        return repr(v)
+
+
+def normalize_fok(value) -> bool:
+    if value is None or value is False:
+        return False
+    if value is True:
+        return True
+    raise ManifestError(f"fok must be true or false, got {_json(value)}")
+
+
+def normalize_order_rules(value):
+    if value is None:
+        return None
+    if value in ("venue", "assumed"):
+        return value
+    raise ManifestError(f'order_rules must be "venue" or "assumed", got {_json(value)}')
+
+
+def normalize_maker_rebate(value):
+    if value is None:
+        return None
+    if not _num(value) or value < 0 or value > 1:
+        raise ManifestError(f"maker_rebate must be a number between 0 and 1, got {_json(value)}")
+    return value
+
+
+def normalize_quote_guard(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ManifestError("quote_guard must be an object")
+    for k in value:
+        if k not in ("max_age_ms", "ask_sum", "include_exits"):
+            raise ManifestError(f"quote_guard has an unknown key {_json(k)}")
+    out = {}
+    if value.get("max_age_ms") is not None:
+        ms = value["max_age_ms"]
+        if not _num(ms) or float(ms) != int(ms) or ms < 0 or ms > 86_400_000:
+            raise ManifestError("quote_guard max_age_ms must be a whole number of milliseconds between 0 and 86400000")
+        out["max_age_ms"] = ms
+    if value.get("ask_sum") is not None:
+        r = value["ask_sum"]
+        if (not isinstance(r, list) or len(r) != 2 or not _num(r[0]) or not _num(r[1])
+                or r[0] < 0 or r[0] > r[1] or r[1] > 2):
+            raise ManifestError("quote_guard ask_sum must be [lo, hi] with 0 <= lo <= hi <= 2")
+        out["ask_sum"] = [r[0], r[1]]
+    if not out:
+        raise ManifestError("quote_guard needs max_age_ms or ask_sum")
+    if value.get("include_exits") is not None:
+        if not isinstance(value["include_exits"], bool):
+            raise ManifestError("quote_guard include_exits must be true or false")
+        if value["include_exits"]:
+            out["include_exits"] = True
+    return out
+
+
+def normalize_mirror_depth(value):
+    if value is None:
+        return None
+    if value == "shared":
+        return value
+    raise ManifestError(f'mirror_depth must be "shared", got {_json(value)}')
+
+
+def normalize_feed_latency(value):
+    """normalizeFeedLatency in api/lib/backtest-datasets.mjs."""
+    if value is None or (_num(value) and value == 0):
+        return None
+    max_ms = CONTRACT["max_latency_ms"]
+    if not _num(value) or float(value) != int(value) or value < 0 or value > max_ms:
+        raise ManifestError(f"feed_latency must be a whole number of milliseconds between 0 and {max_ms}, got {_json(value)}")
+    return int(value)
+
+
+def engine_policy_for(manifest, venue, data="archive"):
+    """enginePolicyFor in api/lib/backtest-datasets.mjs."""
+    fok = normalize_fok(manifest.get("fok"))
+    rules = normalize_order_rules(manifest.get("order_rules"))
+    rebate = normalize_maker_rebate(manifest.get("maker_rebate"))
+    guard = normalize_quote_guard(manifest.get("quote_guard"))
+    mirror = normalize_mirror_depth(manifest.get("mirror_depth"))
+    feed_latency = normalize_feed_latency(manifest.get("feed_latency"))
+    timers = "on_timer" in (manifest.get("hooks") or [])
+    is_global = timers or feed_latency is not None
+    if not fok and rules is None and rebate is None and guard is None and mirror is None and not is_global:
+        return None
+    order_rules = None
+    if rules == "venue":
+        if data != "generic":
+            raise ManifestError('order_rules "venue" needs each market\'s tick and minimum size, which archive markets '
+                                'do not carry; use "assumed" (tick 0.001, minimum 5 shares — measured on the archive, '
+                                'not read per market)')
+        order_rules = {"mode": "venue"}
+    elif rules == "assumed":
+        if data == "generic":
+            raise ManifestError('order_rules "assumed" is for archive markets; your own data carries its tick and '
+                                'minimum — use "venue"')
+        if venue != "polymarket":
+            raise ManifestError(f'order_rules "assumed" is Polymarket\'s; the {venue} archive publishes no order rules')
+        order_rules = {"mode": "assumed", **ASSUMED_ORDER_RULES}
+    if rebate is not None and manifest.get("fee_bps") is not None:
+        raise ManifestError("maker_rebate is a share of the venue's taker fee; it cannot be combined with a flat fee_bps")
+    if mirror is not None and data == "archive" and venue == "polymarket":
+        raise ManifestError('mirror_depth "shared" is for single-book markets (Predict.fun); Polymarket publishes two '
+                            'separate books')
+    return {
+        "fok": fok,
+        "order_rules": order_rules,
+        "maker_rebate": rebate,
+        "quote_guard": guard,
+        "mirror_depth": mirror,
+        "mirror_markets": None if mirror is None else ("all" if data == "archive" else "single_mirrored"),
+        **({"scheduler": "global", "timers": timers, "feed_latency": feed_latency or 0} if is_global else {}),
+    }

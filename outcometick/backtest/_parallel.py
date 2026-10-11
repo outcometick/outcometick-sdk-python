@@ -233,6 +233,19 @@ def _add_result(total, r):
     total["crosschecks"].extend(r.get("crosschecks") or [])
     if r.get("rejection") and not total["rejection"]:
         total["rejection"] = r["rejection"]
+    # Execution options' counters (job.engine): absent unless the run enabled one.
+    o = r.get("orders")
+    if isinstance(o, dict):
+        t = total.setdefault("orders", {"rejected": {}, "rebates": 0})
+        for k, v in (o.get("rejected") or {}).items():
+            t["rejected"][k] = t["rejected"].get(k, 0) + (v or 0)
+        t["rebates"] += o.get("rebates") or 0
+    # Timer counters (on_timer declared): absent otherwise, like the harness.
+    tm = r.get("timers")
+    if isinstance(tm, dict):
+        t = total.setdefault("timers", {"created": 0, "fired": 0, "dropped": 0})
+        for k in t:
+            t[k] += tm.get(k) or 0
     if r.get("maker"):
         if total["maker"] is None:
             total["maker"] = {k: 0 for k in r["maker"]}

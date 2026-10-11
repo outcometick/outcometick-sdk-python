@@ -59,7 +59,25 @@ def market_lines(markets, *, lines_of, header_of, cursor_of=None):
         yield from lines
 
 
-def session_lines(markets, *, lines_of, header_of, cursor_of=None):
+def _open_line(k, header, open_t, timed) -> str:
+    if not timed:
+        return _dumps({"open": {"i": k, **header}})
+    return _dumps({"open": {"i": k, **header},
+                   "t": open_t if isinstance(open_t, (int, float)) and math.isfinite(open_t) else None})
+
+
+def _t(timed, t) -> str:
+    """The ',"t":T' a timed stream carries (sessionLines' T in session-feed.mjs)."""
+    if not timed:
+        return ""
+    return ',"t":%s' % (_num(t) if isinstance(t, (int, float)) and math.isfinite(t) else "null")
+
+
+def _num(t) -> str:
+    return str(int(t)) if float(t).is_integer() else repr(float(t))
+
+
+def session_lines(markets, *, lines_of, header_of, cursor_of=None, timed=False):
     """session mode: every market merged into one time order.
 
     Ties at one millisecond: an opening first, then events in market order,
@@ -110,7 +128,7 @@ def session_lines(markets, *, lines_of, header_of, cursor_of=None):
             if (m.get("market") or {}).get("kind") == "generic":
                 if cursor_of is None:
                     raise ValueError("a generic market needs a streaming cursor (cursor_of)")
-                yield _dumps({"open": {"i": k, **header}})
+                yield _open_line(k, header, open_at(m), timed)
                 mk = m["market"]
                 push_generic({"k": k, "generic": True, "it": iter(cursor_of(m)), "run": open_at(m),
                               "end_at": mk["trade_until_ts_ms"], "close_at": mk["close_ts_ms"],
@@ -130,26 +148,26 @@ def session_lines(markets, *, lines_of, header_of, cursor_of=None):
                 close_at = max(declared, run)
             else:
                 close_at = run
-            yield _dumps({"open": {"i": k, **header}})
+            yield _open_line(k, header, open_at(m), timed)
             push({"k": k, "lines": lines, "times": times, "i": 0, "close_at": close_at})
             continue
         if top is None:
             break
-        _, phase, _, k, _, c = heapq.heappop(heap)
+        t_line, phase, _, k, _, c = heapq.heappop(heap)
         if c.get("generic"):
             if phase == 1:
-                yield '{"i":%d,"e":%s}' % (k, c["line"])
+                yield '{"i":%d%s,"e":%s}' % (k, _t(timed, c["t"]), c["line"])
             elif phase == 2:
-                yield '{"end":%d}' % k
+                yield '{"end":%d%s}' % (k, _t(timed, c["t"]))
                 c["end_sent"] = True
             else:
-                yield '{"close":%d}' % k
+                yield '{"close":%d%s}' % (k, _t(timed, c["t"]))
                 continue
             push_generic(c)
             continue
         if phase == 2:
-            yield '{"close":%d}' % k
+            yield '{"close":%d%s}' % (k, _t(timed, t_line))
             continue
-        yield '{"i":%d,"e":%s}' % (k, c["lines"][c["i"]])
+        yield '{"i":%d%s,"e":%s}' % (k, _t(timed, t_line), c["lines"][c["i"]])
         c["i"] += 1
         push(c)

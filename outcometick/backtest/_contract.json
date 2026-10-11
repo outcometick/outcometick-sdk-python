@@ -186,14 +186,16 @@
     "on_tick": "on_tick",
     "on_book": "on_book",
     "on_trade": "on_trade",
-    "on_settle": "on_settle"
+    "on_settle": "on_settle",
+    "on_timer": "on_timer"
   },
   "known_hooks": [
     "on_market_open",
     "on_tick",
     "on_book",
     "on_trade",
-    "on_settle"
+    "on_settle",
+    "on_timer"
   ],
   "known_datasets": [
     "settlement",

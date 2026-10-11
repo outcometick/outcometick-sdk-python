@@ -37,12 +37,17 @@ import sys
 import tempfile
 
 from ._contract import CONTRACT
-from .datasets import ManifestError, normalize_intervals, resting_policy_for
+from .datasets import (
+    ManifestError, engine_policy_for, normalize_feed_latency, normalize_fok, normalize_intervals, normalize_maker_rebate,
+    normalize_mirror_depth, normalize_order_rules, normalize_quote_guard, resting_policy_for,
+)
 from .decode import BookThrottle, bbo_coverage, build_coverage, count_market_days, count_streams, sort_markets_for_replay
 from .feed import _dumps as _feed_dumps, market_lines, session_lines
 from ._parallel import SharedState, default_workers, fork_context, replay_markets
 from .local import archive_venues, default_venue, load_local_day, load_local_day_cached, local_days, looks_like_archive
-from .report import build_report, fee_model_report, fill_stats, maker_report, parse_fill, parse_trade
+from .report import (
+    REJECT_REASONS, build_report, fee_model_report, fill_stats, maker_report, orders_report, parse_fill, parse_trade,
+)
 from .generic import Dataset, DatasetError, looks_like_generic_dataset
 from .generic_report import apply_generic_extras, generic_report_extras
 from .sample import load_sample
@@ -59,8 +64,8 @@ CHANNEL_RESULT, CHANNEL_TRADE, EXIT_OK, run_job = _H.CHANNEL_RESULT, _H.CHANNEL_
 
 __all__ = ["run", "run_template", "sweep", "load_sample", "Result", "SweepResult", "BacktestError", "Dataset"]
 
-HOOKS = ("on_market_open", "on_tick", "on_book", "on_trade", "on_settle")
-_EMITTING = ("on_tick", "on_book", "on_trade")
+HOOKS = ("on_market_open", "on_tick", "on_book", "on_trade", "on_settle", "on_timer")
+_EMITTING = ("on_tick", "on_book", "on_trade", "on_timer")
 # The assets `ot run` replays when none are named.
 _DEFAULT_ASSETS = ("BTC", "ETH", "SOL", "XRP")
 
@@ -164,7 +169,8 @@ def _hooks_of(klass) -> list:
 
 def run(strategy, data, *, venue=None, assets=None, days=None, datasets=None, intervals=None,
         params=None, mode="market", latency_ms=0, fee_bps=None, seed=1, hooks=None,
-        cancel_latency_ms=None, cache=True, workers=None, mark_max_age_ms=None) -> Result:
+        cancel_latency_ms=None, cache=True, workers=None, mark_max_age_ms=None, fok=False, order_rules=None,
+        maker_rebate=None, quote_guard=None, mirror_depth=None, book_throttle=None, feed_latency=None) -> Result:
     """Backtest `strategy` (a class) over an unpacked archive at `data` -- or
     over your own data for ANY Polymarket binary market: a `Dataset`, or a
     directory with markets.json / markets.jsonl and CLOB frame files.
@@ -174,6 +180,21 @@ def run(strategy, data, *, venue=None, assets=None, days=None, datasets=None, in
     time; an unresolved one is valued at the external mid (else last public
     trade) when trading ends -- `mark_max_age_ms` refuses older marks (a leg
     with no usable mark is valued at 0, and the report says so).
+
+    Execution options (all off by default; same meaning as the manifest keys):
+    fok           True: orders may use tif="fok" (all within the limit, or none)
+    order_rules   "assumed" (archive Polymarket: tick 0.001, min 5 shares, sizes
+                  in 0.01) or "venue" (your own data: each market's own tick/min)
+    maker_rebate  share of the taker fee credited on resting fills (an estimate)
+    quote_guard   {"max_age_ms": n, "ask_sum": [lo, hi]}: opening taker orders
+                  only execute against fresh, consistent quotes
+    mirror_depth  "shared": on single-book markets one fill consumes both tokens
+    feed_latency  ms between an event on the venue and the strategy seeing it
+                  (hooks fire late and ctx.book() lags; orders still match the
+                  venue's book). on_timer + ctx.schedule() wake the strategy
+                  at chosen times.
+    book_throttle False: replay the archive's book unthinned (local only); True
+                  or False also writes coverage.book_throttle
 
     assets    default BTC, ETH, SOL, XRP (as `ot run`); name others to include them.
     datasets  default: settlement and book (so orders can fill), plus trades
@@ -213,9 +234,15 @@ def run(strategy, data, *, venue=None, assets=None, days=None, datasets=None, in
         "fee_bps": fee_bps,
         "mode": mode,
         "params": dict(params or getattr(strategy, "params", None) or {}),
+        **({"fok": True} if fok else {}),
+        **({"order_rules": order_rules} if order_rules is not None else {}),
+        **({"maker_rebate": maker_rebate} if maker_rebate is not None else {}),
+        **({"quote_guard": quote_guard} if quote_guard is not None else {}),
+        **({"mirror_depth": mirror_depth} if mirror_depth is not None else {}),
+        **({"feed_latency": feed_latency} if feed_latency is not None else {}),
     }
     return _run(manifest, lambda: strategy, data=data, venue=venue, assets=assets, days=days, seed=seed, cache=cache,
-                workers=workers, mark_max_age_ms=mark_max_age_ms)
+                workers=workers, mark_max_age_ms=mark_max_age_ms, book_throttle=book_throttle)
 
 
 def run_template(path, data, *, venue=None, assets=None, days=None, seed=1, fee_bps=None, cache=True,
@@ -269,6 +296,8 @@ def run_template(path, data, *, venue=None, assets=None, days=None, seed=1, fee_
         "fee_bps": fee_bps if fee_bps is not None else doc.get("fee_bps"),
         "mode": doc.get("mode") or "market",
         "params": dict(doc.get("params") or {}),
+        **{k: doc[k] for k in ("fok", "order_rules", "maker_rebate", "quote_guard", "mirror_depth", "feed_latency")
+           if k in doc},
     }
     return _run(manifest, lambda: klass, data=data, venue=venue, assets=assets, days=days, seed=seed, cache=cache,
                 workers=workers)
@@ -304,6 +333,15 @@ def _validate(manifest) -> None:
         raise BacktestError("E_MANIFEST", f"fee_bps must be between 0 and {CONTRACT['max_fee_bps']}, got {fee_bps!r}")
     if manifest["mode"] not in ("market", "session"):
         raise BacktestError("E_MANIFEST", f"unknown mode {manifest['mode']!r}; known: market, session")
+    try:
+        normalize_fok(manifest.get("fok"))
+        normalize_order_rules(manifest.get("order_rules"))
+        normalize_maker_rebate(manifest.get("maker_rebate"))
+        normalize_quote_guard(manifest.get("quote_guard"))
+        normalize_mirror_depth(manifest.get("mirror_depth"))
+        normalize_feed_latency(manifest.get("feed_latency"))
+    except ManifestError as err:
+        raise BacktestError("E_MANIFEST", str(err)) from None
 
 
 def _maker_stats(raw):
@@ -336,11 +374,15 @@ def _cache_root(cache):
 
 
 def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, workers=None,
-         mark_max_age_ms=None) -> Result:
+         mark_max_age_ms=None, book_throttle=None) -> Result:
+    if book_throttle is not None and not isinstance(book_throttle, bool):
+        raise BacktestError("E_MANIFEST", f"book_throttle must be True or False, got {book_throttle!r}")
     if mark_max_age_ms is not None and (not isinstance(mark_max_age_ms, int) or isinstance(mark_max_age_ms, bool)
                                         or mark_max_age_ms < 0):
         raise BacktestError("E_MANIFEST", f"mark_max_age_ms must be a whole number of milliseconds, got {mark_max_age_ms!r}")
     if isinstance(data, Dataset) or looks_like_generic_dataset(os.fspath(data)):
+        if book_throttle is not None:
+            raise BacktestError("E_MANIFEST", "book_throttle applies to the archive; your own data is never thinned")
         return _run_generic(manifest, get_class, data=data, venue=venue, days=days, seed=seed, workers=workers,
                             mark_max_age_ms=mark_max_age_ms)
     if mark_max_age_ms is not None:
@@ -369,7 +411,12 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, wo
     events_dir = tempfile.mkdtemp(prefix="ot-events-")
     try:
         markets, missing, bbo_applied = [], [], {}
-        throttle = BookThrottle(venue=venue, assets=scope_assets, frm=want_days[0], to=want_days[-1])
+        throttle = (None if book_throttle is False
+                    else BookThrottle(venue=venue, assets=scope_assets, frm=want_days[0], to=want_days[-1]))
+        try:
+            policy = engine_policy_for(manifest, venue, "archive")
+        except ManifestError as err:
+            raise BacktestError("E_MANIFEST", str(err)) from None
         for day in want_days:
             kw = dict(root=root, day=day, venue=venue, assets=scope_assets, datasets=manifest["datasets"],
                       intervals=manifest["intervals"], throttle=throttle, book_factory=lambda: _Book(None),
@@ -410,12 +457,13 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, wo
         job = {
             "entry": manifest["entry"],
             "hooks": {h: h for h in manifest["hooks"]},
-            "arities": {"on_market_open": 3, "on_tick": 3, "on_book": 3, "on_trade": 3, "on_settle": 4},
+            "arities": {"on_market_open": 3, "on_tick": 3, "on_book": 3, "on_trade": 3, "on_settle": 4, "on_timer": 3},
             "params": manifest["params"],
             "mode": manifest["mode"],
             "seed": int(seed),
             "fees": fees,
             "resting": resting_policy_for(manifest, venue),
+            **({"engine": policy} if policy else {}),
             "limits": CONTRACT["limits"],
             "fillDelayMs": manifest.get("latency") or 0,
         }
@@ -427,8 +475,11 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, wo
         def header_of(m):
             return {"market": m["market"], "stream": m["stream"]}
 
-        stream = (session_lines if manifest["mode"] == "session" else market_lines)(
-            markets, lines_of=lines_of, header_of=header_of)
+        if manifest["mode"] == "session":
+            stream = session_lines(markets, lines_of=lines_of, header_of=header_of,
+                                   timed=bool(policy and policy.get("scheduler") == "global"))
+        else:
+            stream = market_lines(markets, lines_of=lines_of, header_of=header_of)
         it = iter(stream)
 
         def next_line():
@@ -499,6 +550,8 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, wo
             maker=maker_report(stats=result.get("maker"), fills=summary["makerFills"],
                                queue_model=_ENGINE["otmaker"].QUEUE_MODEL,
                                print_lag_ms=_ENGINE["otmaker"].PRINT_LAG_MS),
+            orders=orders_report(policy=policy, stats=result.get("orders")),
+            timers=result.get("timers") if policy and policy.get("timers") else None,
             market_summaries=list(meta.values()),
             market_meta=meta,
             fees_paid=result["fees_paid"],
@@ -522,6 +575,10 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, wo
             ),
             budget=result["budget"],
         )
+        if book_throttle is not None and report.get("coverage") is not None:
+            gate = BookThrottle(venue=venue, assets=scope_assets, frm=want_days[0], to=want_days[-1])
+            report["coverage"]["book_throttle"] = ("off" if book_throttle is False
+                                                  else {a: gate.window_for(a) for a in scope_assets})
         return Result(report, trades, fills, logs)
     finally:
         shutil.rmtree(events_dir, ignore_errors=True)
@@ -537,11 +594,16 @@ def _run_generic(manifest, get_class, *, data, venue, days, seed, workers, mark_
     if venue not in (None, "polymarket"):
         raise BacktestError("E_DATA", "generic data is Polymarket CLOB data; venue must be polymarket or None")
     dataset = data if isinstance(data, Dataset) else Dataset.from_dir(os.fspath(data))
+    try:
+        policy = engine_policy_for(manifest, "polymarket", "generic")
+    except ManifestError as err:
+        raise BacktestError("E_MANIFEST", str(err)) from None
     events_dir = tempfile.mkdtemp(prefix="ot-events-")
     try:
         try:
             decoded = dataset.decode(events_dir=events_dir, book_factory=lambda: _Book(None),
-                                     mark_max_age_ms=mark_max_age_ms)
+                                     mark_max_age_ms=mark_max_age_ms,
+                                     order_rules=bool(policy and (policy.get("order_rules") or {}).get("mode") == "venue"))
         except DatasetError as err:
             raise BacktestError("E_DATA", str(err)) from None
         markets = decoded["markets"]
@@ -555,12 +617,13 @@ def _run_generic(manifest, get_class, *, data, venue, days, seed, workers, mark_
         job = {
             "entry": manifest["entry"],
             "hooks": {h: h for h in manifest["hooks"]},
-            "arities": {"on_market_open": 3, "on_tick": 3, "on_book": 3, "on_trade": 3, "on_settle": 4},
+            "arities": {"on_market_open": 3, "on_tick": 3, "on_book": 3, "on_trade": 3, "on_settle": 4, "on_timer": 3},
             "params": manifest["params"],
             "mode": manifest["mode"],
             "seed": int(seed),
             "fees": fees,
             "resting": resting_policy_for(manifest, "polymarket"),
+            **({"engine": policy} if policy else {}),
             "limits": CONTRACT["limits"],
             "fillDelayMs": manifest.get("latency") or 0,
         }
@@ -575,8 +638,11 @@ def _run_generic(manifest, get_class, *, data, venue, days, seed, workers, mark_
         def header_of(m):
             return {"market": m["market"], "stream": m["stream"], "terminal": m.get("terminal")}
 
-        stream = (session_lines if manifest["mode"] == "session" else market_lines)(
-            markets, lines_of=lines_of, header_of=header_of, cursor_of=cursor_of)
+        if manifest["mode"] == "session":
+            stream = session_lines(markets, lines_of=lines_of, header_of=header_of, cursor_of=cursor_of,
+                                   timed=bool(policy and policy.get("scheduler") == "global"))
+        else:
+            stream = market_lines(markets, lines_of=lines_of, header_of=header_of, cursor_of=cursor_of)
         it = iter(stream)
 
         def next_line():
@@ -626,6 +692,8 @@ def _run_generic(manifest, get_class, *, data, venue, days, seed, workers, mark_
             maker=maker_report(stats=result.get("maker"), fills=summary["makerFills"],
                                queue_model=_ENGINE["otmaker"].QUEUE_MODEL,
                                print_lag_ms=_ENGINE["otmaker"].PRINT_LAG_MS),
+            orders=orders_report(policy=policy, stats=result.get("orders")),
+            timers=result.get("timers") if policy and policy.get("timers") else None,
             market_summaries=list(meta.values()),
             market_meta=meta,
             fees_paid=result["fees_paid"],
@@ -688,6 +756,15 @@ def _demux(lines):
     return trades, fills, "\n".join(logs), _parse_result(result or {}), malformed
 
 
+def _order_stats(raw, fin):
+    """parseOrderStats in runner/harness/protocol.mjs."""
+    if not isinstance(raw, dict):
+        return None
+    rj = raw.get("rejected") if isinstance(raw.get("rejected"), dict) else {}
+    rejected = {k: rj[k] for k in REJECT_REASONS if fin(rj.get(k)) and rj[k] > 0}
+    return {"rejected": rejected, "rebates": raw["rebates"] if fin(raw.get("rebates")) else 0}
+
+
 def _parse_result(r: dict) -> dict:
     def fin(x):
         return isinstance(x, (int, float)) and not isinstance(x, bool) and x == x and abs(x) != float("inf")
@@ -699,6 +776,9 @@ def _parse_result(r: dict) -> dict:
         "fees_paid": r["fees_paid"] if fin(r.get("fees_paid")) else 0,
         "budget": r["budget"] if isinstance(r.get("budget"), dict) else None,
         "maker": _maker_stats(r.get("maker")),
+        "orders": _order_stats(r.get("orders"), fin),
+        "timers": ({k: (r["timers"].get(k) if fin(r["timers"].get(k)) else 0) for k in ("created", "fired", "dropped")}
+                   if isinstance(r.get("timers"), dict) else None),
         "crosschecks": [{
             "market_id": c["market_id"] if isinstance(c.get("market_id"), str) else None,
             "claimed": c.get("claimed"),

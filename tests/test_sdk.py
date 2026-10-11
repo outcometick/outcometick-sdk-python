@@ -129,7 +129,7 @@ class TestStrictNumbers(unittest.TestCase):
             dict(size=10, limit=0.4, tif='gtc', client_id='o7'),       # looks like an engine id
             dict(size=10, limit=0.4, tif='gtc', client_id='x' * 65),
             dict(size=10, limit=0.4, tif='gtc', client_id='bad id'),
-            dict(size=10, limit=0.4, tif='fok'),
+            dict(size=10, limit=0.4, tif='day'),
         ]
         for kw in bad:
             with self.assertRaises(ValueError, msg=f'{kw!r} was accepted'):

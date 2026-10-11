@@ -253,6 +253,12 @@ class BookThrottle:
         self.fallback = book_throttle_ms(venue=venue, asset="*", frm=frm, to=to)
         self._last = {}
 
+    def window_for(self, asset):
+        """windowFor in runner/events.mjs: the window this gate uses for an asset."""
+        if self.dataset is None:
+            return 0
+        return self.per_asset.get(js_string("" if asset is None else asset).upper(), self.fallback)
+
     def keep(self, ds, market_id, ts, asset):
         if ds != self.dataset or self.fallback == 0:
             return True

@@ -108,6 +108,70 @@ class Cases(unittest.TestCase):
         self.assertEqual(r.report["fee_model"]["mode"], "venue")
         self.assertEqual(r.report["fee_model"]["markets"], {"charged": 1, "known_zero": 0, "unknown": 0})
 
+    def test_fok_takes_all_or_nothing(self):
+        class Fok(Strategy):
+            def on_market_open(self, ctx, market):
+                self.n = 0
+
+            def on_tick(self, ctx, tick):
+                self.n += 1
+                if self.n == 1:
+                    return Order(side="UP", size=101, limit=0.99, tif="fok")   # 100 rests: none of it
+                if self.n == 2:
+                    return Order(side="UP", size=100, limit=0.99, tif="fok")   # exactly what rests
+                return None
+        with self.assertRaises(BacktestError):
+            run(Fok, build_archive(self.root), assets=["BTC"])                # not declared
+        r = run(Fok, self.root, assets=["BTC"], fok=True)
+        self.assertEqual([(f["filled"], f.get("reject_reason")) for f in r.fills], [(0, "fok_unfilled"), (100, None)])
+        self.assertEqual(r.report["orders"]["rejected"], {"fok_unfilled": 1})
+
+    def test_assumed_order_rules_and_the_report_saying_so(self):
+        class Small(Strategy):
+            def on_market_open(self, ctx, market):
+                self.n = 0
+
+            def on_tick(self, ctx, tick):
+                self.n += 1
+                if self.n == 1:
+                    return Order(side="UP", size=4, limit=0.99)
+                if self.n == 2:
+                    # A plain order: the runner converts its notional, to 0.01
+                    # shares under the rules (an SDK Order converts when built).
+                    return {"side": "UP", "notional": 3, "limit": 0.52}     # 5.76 shares, not 5
+                return None
+        r = run(Small, build_archive(self.root), assets=["BTC"], order_rules="assumed")
+        self.assertEqual(r.fills[0]["reject_reason"], "below_min_size")
+        self.assertAlmostEqual(r.fills[1]["filled"], 5.76, places=12)
+        rules = r.report["orders"]["order_rules"]
+        self.assertEqual((rules["mode"], rules["assumed_tick"], rules["assumed_min_size"]), ("assumed", 0.001, 5))
+        self.assertNotIn("orders", run(BuyOnce, self.root, assets=["BTC"]).report, "off: no block, old bytes")
+        with self.assertRaises(BacktestError):
+            run(Small, self.root, assets=["BTC"], order_rules="venue")        # archive markets carry no tick
+
+    def test_timers_wake_the_strategy_and_a_feed_latency_delays_what_it_sees(self):
+        class Timed(Strategy):
+            def on_market_open(self, ctx, market):
+                self.log = []
+                ctx.schedule(ctx.now + 30_000, "check")
+
+            def on_tick(self, ctx, tick):
+                self.log.append(ctx.now - tick.ts_ms)
+                return None
+
+            def on_timer(self, ctx, t):
+                ctx.log(f"timer {t.tag} {t.at_ms} {ctx.now}")
+                return Order(side="UP", size=10, limit=0.99)
+        r = run(Timed, build_archive(self.root), assets=["BTC"])
+        self.assertIn(f"timer check {T0 + 30_000} {T0 + 30_000}", r.logs)
+        self.assertEqual(r.report["timers"], {"created": 1, "fired": 1, "dropped": 0})
+        # The timer's order matched the book resting at its own time: 10 at 0.50.
+        self.assertEqual((r.fills[0]["ts_ms"], r.fills[0]["avg_px"]), (T0 + 30_000, 0.5))
+        lagged = run(Timed, self.root, assets=["BTC"], feed_latency=250)
+        self.assertEqual(lagged.report["timers"]["fired"], 1)
+        with self.assertRaises(BacktestError):
+            run(Timed, self.root, assets=["BTC"], feed_latency=2.5)
+
     def test_losing_side_settles_at_zero(self):
         r = run(BuyOnce, build_archive(self.root, outcome="DOWN"), assets=["BTC"])
         self.assertAlmostEqual(r.trades[0]["pnl"], -50.8 - 1.74888, places=9)
@@ -336,6 +400,40 @@ class Parallel(unittest.TestCase):
         seq, par = self.both(Chatty)
         self.assertEqual(seq.report["scanned"]["markets"], 6)
         self.assertGreater(len(seq.trades), 3)
+        self.same(seq, par)
+
+    def test_execution_option_counters_add_up_the_same_in_parallel(self):
+        class Dusty(Strategy):
+            def on_market_open(self, ctx, market):
+                self.n = 0
+
+            def on_tick(self, ctx, tick):
+                self.n += 1
+                if self.n in (1, 3):
+                    return Order(side="UP", size=4, limit=0.99)     # below the minimum
+                if self.n == 2:
+                    return Order(side="UP", size=6, limit=0.99, tif="fok")
+                return None
+        seq, par = self.both(Dusty, fok=True, order_rules="assumed")
+        self.assertGreaterEqual(seq.report["orders"]["rejected"]["below_min_size"], 6)
+        self.same(seq, par)
+
+    def test_timer_counters_add_up_the_same_in_parallel(self):
+        class Timed(Strategy):
+            def on_market_open(self, ctx, market):
+                ctx.schedule(ctx.now + 30_000, "a")
+                self.later = ctx.schedule(ctx.now + 60_000, "b")
+
+            def on_tick(self, ctx, tick):
+                if self.later:
+                    ctx.unschedule(self.later)
+                    self.later = None
+                return None
+
+            def on_timer(self, ctx, t):
+                return Order(side="UP", size=5, limit=0.99)
+        seq, par = self.both(Timed)
+        self.assertEqual(seq.report["timers"], {"created": 12, "fired": 6, "dropped": 0})
         self.same(seq, par)
 
     def test_the_run_wide_log_budget_is_cut_at_the_same_line(self):

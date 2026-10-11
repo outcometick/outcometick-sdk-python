@@ -795,7 +795,24 @@ def _final_record(rec, start, trade_until, resolution):
     return out
 
 
-def decode_generic(*, entries, frames=None, feed=None, events_dir, book_factory, mark_max_age_ms=None):
+def rules_readable(rec) -> bool:
+    """MUST MATCH rulesReadable in runner/generic-data.mjs."""
+    tick, mn = rec.get("tick_size"), rec.get("min_size")
+
+    def num(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+    if not num(tick) or not tick > 0:
+        return False
+    from ._engine import load
+    t = load()["otengine"].js_round(tick * 10_000)
+    if not t >= 1 or abs(t - tick * 10_000) > 1e-6:
+        return False
+    return num(mn) and mn > 0
+
+
+def decode_generic(*, entries, frames=None, feed=None, events_dir, book_factory, mark_max_age_ms=None,
+                   order_rules=False):
     """MUST MATCH decodeGeneric. `frames`: iterable of (at, text_line) or (at, parsed_frame, True)."""
     markets, rejected, by_slug, by_token = index_generic_markets(entries)
     if not markets:
@@ -931,6 +948,11 @@ def decode_generic(*, entries, frames=None, feed=None, events_dir, book_factory,
             os.remove(dest)
             unusable.append({"market_id": mid, "why": "no book inside the trading window"})
             continue
+        if order_rules and not rules_readable(rec):
+            os.remove(dest)
+            unusable.append({"market_id": mid,
+                             "why": "order_rules \"venue\" needs this market's tick_size (on a 0.0001 grid) and min_size"})
+            continue
         terminal = None
         if resolution is None:
             m = quotes.mark(trade_until, mark_max_age_ms)
@@ -954,7 +976,7 @@ def decode_generic(*, entries, frames=None, feed=None, events_dir, book_factory,
     return {"markets": out, "unusable": unusable, "counts": counts}
 
 
-def decode_generic_dir(root, *, events_dir, book_factory, mark_max_age_ms=None):
+def decode_generic_dir(root, *, events_dir, book_factory, mark_max_age_ms=None, order_rules=False):
     entries = read_markets_file(root)
     files = dataset_files(root)
 
@@ -964,7 +986,7 @@ def decode_generic_dir(root, *, events_dir, book_factory, mark_max_age_ms=None):
                 yield (f"{rel}:{i}", line)
 
     out = decode_generic(entries=entries, frames=frames(), events_dir=events_dir,
-                         book_factory=book_factory, mark_max_age_ms=mark_max_age_ms)
+                         book_factory=book_factory, mark_max_age_ms=mark_max_age_ms, order_rules=order_rules)
     out["inputs"] = files
     return out
 
@@ -1181,10 +1203,10 @@ class Dataset:
                       "token_ids": [f"{cid}:0", f"{cid}:1"], "labels": ["Yes", "No"]}
         return cls(entries=[market], pmdata=[(market, rows, trades)])
 
-    def decode(self, *, events_dir, book_factory, mark_max_age_ms=None):
+    def decode(self, *, events_dir, book_factory, mark_max_age_ms=None, order_rules=False):
         if self.root:
             return decode_generic_dir(self.root, events_dir=events_dir, book_factory=book_factory,
-                                      mark_max_age_ms=mark_max_age_ms)
+                                      mark_max_age_ms=mark_max_age_ms, order_rules=order_rules)
 
         def frames():
             for s, source in enumerate(self.frames):
@@ -1200,6 +1222,13 @@ class Dataset:
                 _pmdata_feed(mid, rec, rows, trades)(router)
 
         out = decode_generic(entries=self.entries, frames=frames(), feed=feed, events_dir=events_dir,
-                             book_factory=book_factory, mark_max_age_ms=mark_max_age_ms)
+                             book_factory=book_factory, mark_max_age_ms=mark_max_age_ms, order_rules=order_rules)
+        # Markets fed through the single-book table shape are one book and its
+        # mirror (mirror_depth "shared" needs to know). Internal, never visible
+        # to a strategy (generic_view is a whitelist).
+        single = {generic_record(m)[0] for m, _rows, _t in self.pmdata}
+        for m in out["markets"]:
+            if m["market"]["market_id"] in single:
+                m["market"]["book_model"] = "single_mirrored"
         out["inputs"] = []
         return out

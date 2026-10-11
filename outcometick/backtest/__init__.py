@@ -31,6 +31,9 @@ Limits, stated plainly:
 
 from __future__ import annotations
 
+import copy
+import hashlib
+import json
 import os
 import shutil
 import sys
@@ -46,7 +49,12 @@ from .feed import _dumps as _feed_dumps, market_lines, session_lines
 from ._parallel import SharedState, default_workers, fork_context, replay_markets
 from .local import archive_venues, default_venue, load_local_day, load_local_day_cached, local_days, looks_like_archive
 from .report import (
-    REJECT_REASONS, build_report, fee_model_report, fill_stats, maker_report, orders_report, parse_fill, parse_trade,
+    MARKET_COLUMNS, REJECT_REASONS, build_report, fee_model_report, fill_stats, maker_report, market_rows,
+    orders_report, parse_fill, parse_trade,
+)
+from .fingerprint import (
+    dataset_digest_of_dir, fingerprint_of_files, inputs_digest, local_inputs, memory_dataset_digest, read_submission,
+    run_fingerprint,
 )
 from .generic import Dataset, DatasetError, looks_like_generic_dataset
 from .generic_report import apply_generic_extras, generic_report_extras
@@ -62,7 +70,8 @@ _H = _ENGINE["otharness"]
 CHANNEL_FILL, CHANNEL_LOG, CHANNEL_PROGRESS = _H.CHANNEL_FILL, _H.CHANNEL_LOG, _H.CHANNEL_PROGRESS
 CHANNEL_RESULT, CHANNEL_TRADE, EXIT_OK, run_job = _H.CHANNEL_RESULT, _H.CHANNEL_TRADE, _H.EXIT_OK, _H.run_job
 
-__all__ = ["run", "run_template", "sweep", "load_sample", "Result", "SweepResult", "BacktestError", "Dataset"]
+__all__ = ["run", "run_template", "sweep", "fingerprint", "load_sample", "Result", "SweepResult", "BacktestError",
+           "Dataset"]
 
 HOOKS = ("on_market_open", "on_tick", "on_book", "on_trade", "on_settle", "on_timer")
 _EMITTING = ("on_tick", "on_book", "on_trade", "on_timer")
@@ -83,11 +92,14 @@ class BacktestError(RuntimeError):
 class Result:
     """A finished backtest: the report plus every trade, fill and log line."""
 
-    def __init__(self, report: dict, trades: list, fills: list, logs: str):
+    def __init__(self, report: dict, trades: list, fills: list, logs: str, markets: list | None = None):
         self.report = report
         self.trades = trades
         self.fills = fills
         self.logs = logs
+        # One row per market replayed, entered or not -- markets.csv in a
+        # hosted or `ot run` archive (report.MARKET_COLUMNS).
+        self.markets = markets if markets is not None else []
 
     @property
     def metrics(self) -> dict:
@@ -97,6 +109,11 @@ class Result:
         """Trades as a pandas DataFrame (needs pandas)."""
         import pandas as pd
         return pd.DataFrame(self.trades)
+
+    def markets_df(self):
+        """Every market replayed, entered or not, as a pandas DataFrame (needs pandas)."""
+        import pandas as pd
+        return pd.DataFrame(self.markets, columns=list(MARKET_COLUMNS))
 
     def fills_df(self):
         """Fills as a pandas DataFrame (needs pandas)."""
@@ -257,8 +274,16 @@ def run_template(path, data, *, venue=None, assets=None, days=None, seed=1, fee_
     import importlib.util
     import json
 
-    with open(os.path.join(path, "outcometick.json"), encoding="utf-8") as fh:
-        doc = json.load(fh)
+    # The directory as it stands BEFORE any of its code runs: the manifest is
+    # parsed from this snapshot and the run's fingerprint is taken from it. The
+    # strategy's own code could rewrite its files while it loads or runs, so
+    # the directory is compared with the snapshot after loading and after the
+    # run, and a change refuses the run rather than reporting the wrong files.
+    snapshot = read_submission(path)
+    doc_file = next((f for f in snapshot if f["name"] == "outcometick.json"), None)
+    if doc_file is None:
+        raise BacktestError("E_MANIFEST", f"no outcometick.json in {os.path.abspath(path)}")
+    doc = json.loads(doc_file["content"])
     if not str(doc.get("language", "")).startswith("python"):
         raise BacktestError("E_MANIFEST", "this runs Python strategies; use `ot run` for JavaScript")
     if doc.get("reference"):
@@ -270,8 +295,10 @@ def run_template(path, data, *, venue=None, assets=None, days=None, seed=1, fee_
                                           "run this one with `ot run` or submit it")
     file_name, _, class_name = str(doc.get("entry", "")).rpartition(":")
     module_name = os.path.splitext(os.path.basename(file_name))[0]
-    spec = importlib.util.spec_from_file_location(module_name, os.path.join(path, file_name))
-    if spec is None or spec.loader is None:
+    entry_file = next((f for f in snapshot if f["name"] == file_name), None)
+    entry_path = os.path.join(path, file_name)
+    spec = importlib.util.spec_from_file_location(module_name, entry_path)
+    if spec is None or spec.loader is None or entry_file is None:
         raise BacktestError("E_ENTRY", f"could not load {file_name}")
     module = importlib.util.module_from_spec(spec)
     # Registered before it runs, as the sandbox harness does: dataclasses and
@@ -279,17 +306,60 @@ def run_template(path, data, *, venue=None, assets=None, days=None, seed=1, fee_
     # @dataclass with postponed annotations fails to import otherwise.
     previous = sys.modules.get(module_name)
     sys.modules[module_name] = module
+    # Bytecode caches are read from a fresh, empty directory for as long as the
+    # strategy loads and runs: a stale .pyc beside an edited source (same size,
+    # same second) would otherwise run code the fingerprint does not describe.
+    # The entry itself is compiled from the snapshot's text, not from disk.
+    # A module this process already imported from the strategy directory (a
+    # helper, in a notebook that ran the strategy before) would be reused as
+    # is, whatever the file says now: forget them, so every import comes from
+    # the files just hashed.
+    root = os.path.realpath(path) + os.sep
+    own_names = {os.path.splitext(f["name"])[0].replace("/", ".") for f in snapshot if f["name"].endswith(".py")}
+    own_names |= {n.split(".")[0] for n in own_names}
+    for name in [n for n, m in list(sys.modules.items())
+                 if n in _STRATEGY_MODULES or n.split(".")[0] in own_names
+                 or (isinstance(getattr(m, "__file__", None), str) and os.path.realpath(m.__file__).startswith(root))]:
+        if name != module_name:
+            del sys.modules[name]
+    importlib.invalidate_caches()
+    import tempfile
+    previous_prefix = sys.pycache_prefix
+    sys.pycache_prefix = tempfile.mkdtemp(prefix="ot-pycache-")
     try:
-        spec.loader.exec_module(module)
+        exec(compile(entry_file["content"], entry_path, "exec"), module.__dict__)  # noqa: S102
     except Exception as err:  # noqa: BLE001
+        sys.pycache_prefix = previous_prefix
         if previous is not None:
             sys.modules[module_name] = previous
         else:
             sys.modules.pop(module_name, None)
         raise BacktestError("E_ENTRY", f"could not load {file_name}: {err}") from err
-    klass = getattr(module, class_name, None)
-    if not isinstance(klass, type):
-        raise BacktestError("E_ENTRY", f"{file_name} does not define a class named {class_name}")
+    try:
+        klass = getattr(module, class_name, None)
+        if not isinstance(klass, type):
+            raise BacktestError("E_ENTRY", f"{file_name} does not define a class named {class_name}")
+        _same_files(path, snapshot, "while it loaded")
+        return _run_template_rest(path, data, doc, snapshot, klass, file_name, class_name, venue=venue, assets=assets,
+                                  days=days, seed=seed, fee_bps=fee_bps, cache=cache, workers=workers)
+    finally:
+        import shutil as _shutil
+        _shutil.rmtree(sys.pycache_prefix, ignore_errors=True)
+        sys.pycache_prefix = previous_prefix
+        # Remembered, so the next run_template -- of this directory or any
+        # other -- imports its own files rather than these.
+        _STRATEGY_MODULES.update(n for n, m in list(sys.modules.items())
+                                 if isinstance(getattr(m, "__file__", None), str)
+                                 and os.path.realpath(m.__file__).startswith(root))
+
+
+# Module names any run_template in this process has loaded from a strategy
+# directory (see run_template).
+_STRATEGY_MODULES: set = set()
+
+
+def _run_template_rest(path, data, doc, snapshot, klass, file_name, class_name, *, venue, assets, days, seed, fee_bps,
+                       cache, workers):
     manifest = {
         "schema": doc.get("schema", 1),
         "language": doc.get("language"),
@@ -306,8 +376,71 @@ def run_template(path, data, *, venue=None, assets=None, days=None, seed=1, fee_
                                     "queue_model")
            if k in doc},
     }
-    return _run(manifest, lambda: klass, data=data, venue=venue, assets=assets, days=days, seed=seed, cache=cache,
-                workers=workers)
+    result = _run(manifest, lambda: klass, data=data, venue=venue, assets=assets, days=days, seed=seed, cache=cache,
+                  workers=workers, source_files=snapshot, fee_bps_override=fee_bps)
+    _same_files(path, snapshot, "during the run")
+    return result
+
+
+def _same_files(path, snapshot, when):
+    """Refuse a run whose strategy directory changed under it (see run_template)."""
+    if read_submission(path) != snapshot:
+        raise BacktestError("E_RUNTIME", f"the strategy directory changed {when}: its fingerprint would not describe "
+                                         "the code that ran -- keep the files unchanged while it runs")
+
+
+def fingerprint(path, *, assets=None, days=None, venue="polymarket", seed=1, fee_bps=None, data=None,
+                book_throttle=None, mark_max_age_ms=None) -> dict:
+    """A strategy directory's pre-registration fingerprint, without running it.
+
+    The same value `ot fingerprint` prints and the report of the matching run
+    carries (report["fingerprint"]): one sha256 over the code, manifest, params,
+    execution options, scope and seed. Pass the assets and the days list you
+    will run (from = days[0], to = days[-1], as the report's scope); `data`, if
+    given and your own dataset, makes it a generic-data fingerprint.
+    """
+    files = read_submission(path)
+    generic = data is not None and (isinstance(data, Dataset) or looks_like_generic_dataset(os.fspath(data)))
+    data_sha = None
+    if generic:
+        scope = {"venue": "polymarket", "assets": [], "days": []}
+        data_sha = _dataset_sha256(data if isinstance(data, Dataset) else Dataset.from_dir(os.fspath(data)))
+    else:
+        asset_list = [str(a).strip().upper() for a in (assets or []) if str(a).strip()]
+        if not asset_list or not days:
+            raise BacktestError("E_SCOPE", "assets and days are required: the fingerprint covers the scope you will run")
+        day_list = list(days)
+        if day_list != sorted(set(day_list)):
+            raise BacktestError("E_SCOPE", "days must be listed in order, each once")
+        scope = {"venue": venue, "assets": asset_list, "days": day_list}
+    fp = fingerprint_of_files(files, scope=scope, seed=int(seed), data="generic" if generic else "archive",
+                              fee_bps_override=fee_bps, data_sha256=data_sha,
+                              replay={"book_throttle": book_throttle is not False, "mark_max_age_ms": mark_max_age_ms})
+    if fp is None:
+        raise BacktestError("E_MANIFEST", f"no readable outcometick.json in {os.path.abspath(path)}")
+    return fp
+
+
+def _fingerprint(manifest, source_files, *, scope, seed, data, fee_bps_override, data_sha256=None, replay=None,
+                 inputs=None):
+    """The run's pre-registration fingerprint (fingerprint.py): from the strategy
+    directory for run_template, from the in-process manifest (no code hash) for run()."""
+    if source_files is not None:
+        return fingerprint_of_files(source_files, scope=scope, seed=int(seed), data=data, fee_bps_override=fee_bps_override,
+                                    data_sha256=data_sha256, replay=replay, inputs=inputs)
+    # An in-process class has no file bytes to hash, and a parsed number past
+    # 2^53 would round in the shared canonical form: its manifest, exactly.
+    exact = hashlib.sha256(json.dumps(manifest, sort_keys=True, default=repr).encode("utf-8")).hexdigest()
+    fp = run_fingerprint(manifest=manifest, code=None, scope=scope, seed=int(seed), data=data,
+                         data_sha256=data_sha256, replay=replay, py_exact=exact)
+    return {**fp, "inputs_sha256": inputs_digest(inputs) if inputs is not None else None}
+
+
+def _dataset_sha256(dataset):
+    """Your own data's identity: its files' bytes for a directory (as `ot run --data`), else its content."""
+    if dataset.root and not (dataset.entries or dataset.frames or dataset.pmdata):
+        return dataset_digest_of_dir(dataset.root)
+    return memory_dataset_digest(dataset)
 
 
 def _validate(manifest) -> None:
@@ -382,7 +515,7 @@ def _cache_root(cache):
 
 
 def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, workers=None,
-         mark_max_age_ms=None, book_throttle=None) -> Result:
+         mark_max_age_ms=None, book_throttle=None, source_files=None, fee_bps_override=None) -> Result:
     if book_throttle is not None and not isinstance(book_throttle, bool):
         raise BacktestError("E_MANIFEST", f"book_throttle must be True or False, got {book_throttle!r}")
     if mark_max_age_ms is not None and (not isinstance(mark_max_age_ms, int) or isinstance(mark_max_age_ms, bool)
@@ -392,7 +525,8 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, wo
         if book_throttle is not None:
             raise BacktestError("E_MANIFEST", "book_throttle applies to the archive; your own data is never thinned")
         return _run_generic(manifest, get_class, data=data, venue=venue, days=days, seed=seed, workers=workers,
-                            mark_max_age_ms=mark_max_age_ms)
+                            mark_max_age_ms=mark_max_age_ms, source_files=source_files,
+                            fee_bps_override=fee_bps_override)
     if mark_max_age_ms is not None:
         raise BacktestError("E_MANIFEST", "mark_max_age_ms applies to generic data only: archive markets settle "
                                           "on their official outcome")
@@ -406,6 +540,10 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, wo
     if not available:
         raise BacktestError("E_DATA", f"no dated files under {os.path.abspath(root)}")
     want_days = list(days) if days else available
+    if days and want_days != sorted(set(want_days)):
+        # The order days are listed in is the order they replay, and the list is
+        # what a fingerprint pins: one canonical form, refused otherwise.
+        raise BacktestError("E_SCOPE", "days must be listed in order, each once")
     unknown = [d for d in want_days if d not in available]
     if unknown:
         raise BacktestError("E_DATA", f"{', '.join(unknown)} not in {os.path.abspath(root)} — "
@@ -425,6 +563,7 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, wo
             policy = engine_policy_for(manifest, venue, "archive")
         except ManifestError as err:
             raise BacktestError("E_MANIFEST", str(err)) from None
+        run_inputs: list = []
         for day in want_days:
             kw = dict(root=root, day=day, venue=venue, assets=scope_assets, datasets=manifest["datasets"],
                       intervals=manifest["intervals"], throttle=throttle, book_factory=lambda: _Book(None),
@@ -438,6 +577,8 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, wo
                 raise BacktestError("E_MANIFEST", str(err)) from None
             if loaded.get("bbo_keys"):
                 bbo_applied.setdefault(day, set()).update(loaded["bbo_keys"])
+            # Every archive file this day was read from (the fingerprint's inputs_sha256).
+            run_inputs.extend(loaded.get("inputs") or [])
             unusable = loaded.get("unusable") or []
             if not loaded["markets"]:
                 entry = {"day": day, "reason": loaded.get("reason") or "no markets"}
@@ -505,6 +646,18 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, wo
                     raise RunAbort("E_HOOK_SIG", f"{h} was declared but {h}() is not defined on the class")
             return klass
 
+        # The fingerprint is taken BEFORE any strategy code runs, from a deep
+        # copy: a strategy that rewrote its own params mid-run must not change
+        # what the report says it was run with.
+        fingerprint = _fingerprint(
+            copy.deepcopy(manifest), source_files, seed=seed, data="archive", fee_bps_override=fee_bps_override,
+            scope={
+                "venue": venue,
+                "assets": asset_list or list(dict.fromkeys(m["market"]["asset"] for m in markets
+                                                           if m["market"].get("asset"))),
+                "days": list(want_days),
+            },
+            replay={"book_throttle": book_throttle is not False}, inputs=local_inputs(root, run_inputs))
         # Replay is parallel only when asked for (see `workers` in run()):
         # decoding never runs strategy code, replaying does.
         parallel = (workers is not None and manifest["mode"] == "market" and n_workers > 1
@@ -534,8 +687,9 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, wo
             mk = m["market"]
             meta[mk["market_id"]] = {
                 "market_id": mk["market_id"], "asset": mk.get("asset"), "interval": mk.get("interval"),
-                "outcome": mk.get("outcome"), "up_px": m.get("up_px"), "down_px": m.get("down_px"),
-                "stream": m.get("stream"),
+                "outcome": mk.get("outcome"), "open_ts_ms": mk.get("open_ts_ms"),
+                "close_ts_ms": mk.get("close_ts_ms"), "strike": mk.get("strike"),
+                "up_px": m.get("up_px"), "down_px": m.get("down_px"), "stream": m.get("stream"),
             }
         delay = manifest.get("latency") or 0
         summary = fill_stats(fills)
@@ -544,6 +698,7 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, wo
             submitted_at=0,
             manifest={"schema": manifest["schema"], "language": manifest["language"], "mode": manifest["mode"]},
             source_sha256=None,
+            fingerprint=fingerprint,
             scope={
                 "venue": venue,
                 "assets": asset_list or list(dict.fromkeys(m["market"]["asset"] for m in markets if m["market"].get("asset"))),
@@ -588,12 +743,13 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, wo
             gate = BookThrottle(venue=venue, assets=scope_assets, frm=want_days[0], to=want_days[-1])
             report["coverage"]["book_throttle"] = ("off" if book_throttle is False
                                                   else {a: gate.window_for(a) for a in scope_assets})
-        return Result(report, trades, fills, logs)
+        return Result(report, trades, fills, logs, market_rows(trades, meta))
     finally:
         shutil.rmtree(events_dir, ignore_errors=True)
 
 
-def _run_generic(manifest, get_class, *, data, venue, days, seed, workers, mark_max_age_ms) -> Result:
+def _run_generic(manifest, get_class, *, data, venue, days, seed, workers, mark_max_age_ms, source_files=None,
+                 fee_bps_override=None) -> Result:
     """Generic data (generic.py): the same replay and report as an archive run,
     with the generic report fields. MUST MATCH the generic branch of
     cli/commands/run.mjs."""
@@ -669,6 +825,11 @@ def _run_generic(manifest, get_class, *, data, venue, days, seed, workers, mark_
                     raise RunAbort("E_HOOK_SIG", f"{h} was declared but {h}() is not defined on the class")
             return klass
 
+        # Before any strategy code runs -- see the archive path.
+        fingerprint = _fingerprint(copy.deepcopy(manifest), source_files,
+                                   scope={"venue": "polymarket", "assets": [], "days": []},
+                                   seed=seed, data="generic", fee_bps_override=fee_bps_override,
+                                   data_sha256=_dataset_sha256(dataset), replay={"mark_max_age_ms": mark_max_age_ms})
         code = run_job(job, load_class, next_line, emit)
         trades, fills, logs, result, malformed = _demux(out_lines)
         if code != EXIT_OK:
@@ -682,8 +843,9 @@ def _run_generic(manifest, get_class, *, data, venue, days, seed, workers, mark_
             mk = m["market"]
             meta[mk["market_id"]] = {
                 "market_id": mk["market_id"], "asset": mk.get("asset"), "interval": mk.get("interval"),
-                "outcome": mk.get("outcome"), "up_px": m.get("up_px"), "down_px": m.get("down_px"),
-                "stream": m.get("stream"),
+                "outcome": mk.get("outcome"), "open_ts_ms": mk.get("open_ts_ms"),
+                "close_ts_ms": mk.get("close_ts_ms"), "strike": mk.get("strike"),
+                "up_px": m.get("up_px"), "down_px": m.get("down_px"), "stream": m.get("stream"),
             }
         delay = manifest.get("latency") or 0
         summary = fill_stats(fills)
@@ -693,6 +855,7 @@ def _run_generic(manifest, get_class, *, data, venue, days, seed, workers, mark_
             submitted_at=0,
             manifest={"schema": manifest["schema"], "language": manifest["language"], "mode": manifest["mode"]},
             source_sha256=None,
+            fingerprint=fingerprint,
             scope={"venue": "polymarket", "assets": [], "from": None, "to": None,
                    "market_days": n, "archived_day_count": n},
             scanned={"markets": result["markets_run"], "market_days": n, "events": result["events_seen"]},
@@ -729,7 +892,7 @@ def _run_generic(manifest, get_class, *, data, venue, days, seed, workers, mark_
         )
         report = apply_generic_extras(report, generic_report_extras(
             trades=trades, markets=markets, unusable=decoded["unusable"], counts=decoded["counts"]))
-        return Result(report, trades, fills, logs)
+        return Result(report, trades, fills, logs, market_rows(trades, meta))
     finally:
         shutil.rmtree(events_dir, ignore_errors=True)
 

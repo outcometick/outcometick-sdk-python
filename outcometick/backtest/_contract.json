@@ -225,5 +225,7 @@
     "maxParams": 64,
     "maxSweepCells": 256,
     "archiveRetentionDays": 7
-  }
+  },
+  "sandbox_image_tag": "1.24.0",
+  "decode_semantics": 1
 }

@@ -180,6 +180,17 @@ def edge_per_contract(trades) -> float:
     return edge / contracts if contracts > 0 else 0
 
 
+def edge_per_trade(trades):
+    """edgePerTrade in runner/engine/report.mjs."""
+    settled = _settled(trades)
+    if not settled:
+        return None
+    edge = 0
+    for t in settled:
+        edge += contract_value(t["side"], t["outcome"]) - t["entry_px"]
+    return r4(edge / len(settled))
+
+
 def brier(trades):
     settled = _settled(trades)
     if not settled:
@@ -205,6 +216,20 @@ def metrics(trades, *, fees_paid=0, days=1):
     daily = list(by_day.values())
     sd = _stdev(daily)
     sharpe = None if sd == 0 else (_mean(daily) / sd) * math.sqrt(365)
+    down_sq = 0
+    winning_days = 0
+    best_day = worst_day = None
+    for d in daily:
+        if d < 0:
+            down_sq += d * d
+        if d > 0:
+            winning_days += 1
+        if best_day is None or d > best_day:
+            best_day = d
+        if worst_day is None or d < worst_day:
+            worst_day = d
+    downside = math.sqrt(down_sq / len(daily)) if daily else 0
+    sortino = None if len(daily) < 2 or downside == 0 else (_mean(daily) / downside) * math.sqrt(365)
     holds = [t["closed_ms"] - t["opened_ms"] for t in closed
              if t.get("opened_ms") is not None and t.get("closed_ms") is not None]
 
@@ -215,6 +240,12 @@ def metrics(trades, *, fees_paid=0, days=1):
         "max_drawdown": None if dd["pct"] is None else r4(dd["pct"]),
         "max_drawdown_abs": r2(dd["abs"]),
         "sharpe": None if sharpe is None else r2(sharpe),
+        "sortino": None if sortino is None else r2(sortino),
+        "return_over_max_drawdown": r2(net / dd["abs"]) if dd["abs"] > 0 else None,
+        "trading_days": len(daily),
+        "winning_days": winning_days,
+        "best_day": None if best_day is None else r2(best_day),
+        "worst_day": None if worst_day is None else r2(worst_day),
         "trades": len(closed),
         "markets_traded": len({t.get("market_id") for t in closed}),
         "return_on_collateral": r4(net / collateral) if collateral > 0 else None,
@@ -222,6 +253,7 @@ def metrics(trades, *, fees_paid=0, days=1):
         "return_on_peak": r4(net / peak) if peak > 0 else None,
         "holding_ratio": None if hold is None else r4(hold),
         "edge_per_contract": r4(edge_per_contract(closed)) if closed else None,
+        "edge_per_trade": edge_per_trade(closed),
         "brier_score": r4(brier(closed)),
         "fees": r2(-abs(fees_paid)),
         "avg_hold_ms": int(js_math_round(_mean(holds))) if holds else None,
@@ -380,11 +412,126 @@ class MakerFillAccumulator:
         }
 
 
+class ActivityAccumulator:
+    """activityAccumulator in runner/engine/report.mjs."""
+
+    def __init__(self):
+        self.contracts = self.value = self.taker = self.maker = 0
+        self.fills = 0
+
+    def add(self, f):
+        filled = f.get("filled")
+        px = f.get("avg_px")
+        if not (_finite(filled) and filled > 0) or not _finite(px):
+            return
+        self.fills += 1
+        self.contracts += filled
+        self.value += filled * px
+        if f.get("liquidity") == "maker":
+            self.maker += filled
+        else:
+            self.taker += filled
+
+    def result(self):
+        return {"fills": self.fills, "contracts": r2(self.contracts), "value": r2(self.value),
+                "taker_contracts": r2(self.taker), "maker_contracts": r2(self.maker)}
+
+
 def fill_stats(fills):
     maker = MakerFillAccumulator()
+    activity = ActivityAccumulator()
     for f in fills:
         maker.add(f)
-    return {"count": len(fills), "slippage": slippage(fills), "makerFills": maker.result()}
+        activity.add(f)
+    return {"count": len(fills), "slippage": slippage(fills), "makerFills": maker.result(),
+            "activity": activity.result()}
+
+
+MARKET_COLUMNS = (
+    "market_id", "asset", "interval", "settlement", "open_ts_ms", "close_ts_ms", "strike", "outcome",
+    "up_px", "down_px", "entered", "trades", "contracts", "net_pnl", "fees", "first_entry_ms",
+    "edge_per_contract", "edge_per_trade",
+)
+
+
+def market_rows(trades, market_meta):
+    """marketRows in runner/engine/report.mjs: every market replayed, entered or not."""
+    by_market: dict = {}
+    for t in trades:
+        if not _finite(t.get("pnl")):
+            continue
+        by_market.setdefault(t.get("market_id"), []).append(t)
+    rows = []
+    for mid, m in (market_meta or {}).items():
+        ts = by_market.get(mid, [])
+        pnl = fees = contracts = 0
+        first = None
+        for t in ts:
+            pnl += t["pnl"]
+            fees += _coalesce(t.get("fees"), 0)
+            contracts += t.get("size") or 0
+            o = t.get("opened_ms")
+            if o is not None and (first is None or o < first):
+                first = o
+        settled = _settled(ts)
+        rows.append({
+            "market_id": mid,
+            "asset": m.get("asset"),
+            "interval": m.get("interval"),
+            "settlement": m.get("stream"),
+            "open_ts_ms": m.get("open_ts_ms"),
+            "close_ts_ms": m.get("close_ts_ms"),
+            "strike": m.get("strike"),
+            "outcome": m.get("outcome"),
+            "up_px": m.get("up_px"),
+            "down_px": m.get("down_px"),
+            "entered": len(ts) > 0,
+            "trades": len(ts),
+            "contracts": r4(contracts),
+            "net_pnl": r4(pnl),
+            "fees": r4(fees),
+            "first_entry_ms": first,
+            "edge_per_contract": r4(edge_per_contract(settled)) if settled else None,
+            "edge_per_trade": edge_per_trade(settled),
+        })
+    return rows
+
+
+def by_settlement(rows, trades):
+    """bySettlement in runner/engine/report.mjs."""
+    rule = {r["market_id"]: (r["settlement"] if r["settlement"] is not None else "unknown") for r in rows}
+    groups: dict = {}
+
+    def group(k):
+        if k not in groups:
+            groups[k] = {"settlement": k, "markets": 0, "markets_entered": 0, "trades": []}
+        return groups[k]
+    for r in rows:
+        g = group(r["settlement"] if r["settlement"] is not None else "unknown")
+        g["markets"] += 1
+        if r["entered"]:
+            g["markets_entered"] += 1
+    for t in trades:
+        if not _finite(t.get("pnl")) or t.get("market_id") not in rule:
+            continue
+        group(rule[t.get("market_id")])["trades"].append(t)
+    out = []
+    for k in sorted(groups):
+        g = groups[k]
+        pnl = 0
+        for t in g["trades"]:
+            pnl += t["pnl"]
+        settled = _settled(g["trades"])
+        out.append({
+            "settlement": k,
+            "markets": g["markets"],
+            "markets_entered": g["markets_entered"],
+            "trades": len(g["trades"]),
+            "net_pnl": r2(pnl),
+            "edge_per_contract": r4(edge_per_contract(settled)) if settled else None,
+            "edge_per_trade": edge_per_trade(settled),
+        })
+    return out
 
 
 def maker_report(*, stats, fills, queue_model, print_lag_ms, queue_prob=None):
@@ -514,7 +661,7 @@ def orders_report(*, policy, stats):
 def build_report(*, run_id, submitted_at, manifest, scope, source_sha256=None, trades, fill_summary,
                  market_summaries, market_meta, fees_paid=0, fill_delay_ms=0, fee_model=None, sweep=None,
                  coverage=None, crosschecks=(), budget=None, seed=None, scanned=None, maker=None, orders=None,
-                 timers=None):
+                 timers=None, fingerprint=None):
     closed = [t for t in trades if _finite(t.get("pnl"))]
     equity = equity_curve(closed)
     matched = sum(1 for c in crosschecks if c.get("match"))
@@ -523,6 +670,7 @@ def build_report(*, run_id, submitted_at, manifest, scope, source_sha256=None, t
     return {
         "run_id": run_id,
         "source_sha256": source_sha256,
+        "fingerprint": fingerprint,
         "generated_ms": submitted_at,
         "sdk_schema": manifest.get("schema"),
         "language": manifest.get("language"),
@@ -550,6 +698,8 @@ def build_report(*, run_id, submitted_at, manifest, scope, source_sha256=None, t
         "baselines": baselines(market_summaries or [], size=(
             _sum([t.get("size") or 0 for t in closed]) / len(closed) if closed else 1)),
         "split": split_by_market(closed, market_meta or {}),
+        "by_settlement": by_settlement(market_rows(closed, market_meta or {}), closed),
+        "activity": fill_summary.get("activity"),
         "slippage": fill_summary["slippage"],
         "fill_delay_ms": fill_delay_ms,
         "fee_model": fee_model,

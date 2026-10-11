@@ -14,11 +14,12 @@ import gzip
 import json
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 
 from outcometick import Order, Strategy
-from outcometick.backtest import BacktestError, run, sweep
+from outcometick.backtest import BacktestError, run, run_template, sweep
 
 T0 = 1788825600000  # 2026-09-08T00:00:00Z
 UP_TOKEN, DOWN_TOKEN = "1" * 70, "2" * 70
@@ -171,6 +172,137 @@ class Cases(unittest.TestCase):
         self.assertEqual(lagged.report["timers"]["fired"], 1)
         with self.assertRaises(BacktestError):
             run(Timed, self.root, assets=["BTC"], feed_latency=2.5)
+
+    def test_fingerprint_is_taken_before_the_strategy_runs(self):
+        class Wiper(Strategy):
+            def on_market_open(self, ctx, market):
+                self.done = False
+
+            def on_tick(self, ctx, tick):
+                if self.done:
+                    return None
+                self.done = True
+                cfg = ctx.p["cfg"]
+                size = 10 if cfg.get("threshold", 0) > 0.5 else 5
+                cfg.clear()                       # rewrite its own params mid-run
+                return Order(side="UP", size=size, limit=0.99)
+        root = build_archive(self.root)
+        a = run(Wiper, root, assets=["BTC"], params={"cfg": {"threshold": 0.1}})
+        b = run(Wiper, root, assets=["BTC"], params={"cfg": {"threshold": 0.9}})
+        self.assertNotEqual(a.fills[0]["filled"], b.fills[0]["filled"])
+        self.assertNotEqual(a.report["fingerprint"]["sha256"], b.report["fingerprint"]["sha256"])
+
+    def test_a_strategy_that_rewrites_its_own_files_is_refused(self):
+        import json as _json
+        d = tempfile.mkdtemp(prefix="ot-self-rewrite-")
+        try:
+            with open(os.path.join(d, "outcometick.json"), "w") as fh:
+                _json.dump({"schema": 1, "language": "python@3.14", "entry": "strategy.py:S",
+                            "hooks": ["on_tick"], "datasets": ["settlement", "book"]}, fh)
+            with open(os.path.join(d, "strategy.py"), "w") as fh:
+                fh.write("import os\n"
+                         "from outcometick import Strategy\n"
+                         "open(os.path.join(os.path.dirname(__file__), 'outcometick.json'), 'a').write(' ')\n"
+                         "class S(Strategy):\n"
+                         "    def on_tick(self, ctx, tick):\n"
+                         "        return None\n")
+            with self.assertRaises(BacktestError) as cm:
+                run_template(d, build_archive(self.root))
+            self.assertIn("changed while it loaded", str(cm.exception))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_a_stale_bytecode_cache_never_runs_instead_of_the_source(self):
+        import json as _json
+        import py_compile
+        d = tempfile.mkdtemp(prefix="ot-stale-pyc-")
+        try:
+            with open(os.path.join(d, "outcometick.json"), "w") as fh:
+                _json.dump({"schema": 1, "language": "python@3.14", "entry": "strategy.py:S",
+                            "hooks": ["on_tick"], "datasets": ["settlement", "book"]}, fh)
+            src = ("from outcometick import Order, Strategy\n"
+                   "SIZE = {}\n"
+                   "class S(Strategy):\n"
+                   "    def on_tick(self, ctx, tick):\n"
+                   "        if getattr(self, 'done', False):\n"
+                   "            return None\n"
+                   "        self.done = True\n"
+                   "        return Order(side='UP', size=SIZE, limit=0.99)\n")
+            path = os.path.join(d, "strategy.py")
+            with open(path, "w") as fh:
+                fh.write(src.format(5))
+            py_compile.compile(path)                       # a cache of the SIZE = 5 version
+            st = os.stat(path)
+            with open(path, "w") as fh:
+                fh.write(src.format(7))                    # same length, same second
+            os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+            r = run_template(d, build_archive(self.root))
+            self.assertEqual(r.fills[0]["requested"], 7)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_a_helper_module_edited_between_two_runs_in_one_process_is_reloaded(self):
+        import json as _json
+        d = tempfile.mkdtemp(prefix="ot-helper-")
+        sys.path.insert(0, d)
+        try:
+            with open(os.path.join(d, "outcometick.json"), "w") as fh:
+                _json.dump({"schema": 1, "language": "python@3.14", "entry": "strategy.py:S",
+                            "hooks": ["on_tick"], "datasets": ["settlement", "book"]}, fh)
+            with open(os.path.join(d, "strategy.py"), "w") as fh:
+                fh.write("from outcometick import Order, Strategy\n"
+                         "import ot_helper_mod\n"
+                         "class S(Strategy):\n"
+                         "    def on_tick(self, ctx, tick):\n"
+                         "        if getattr(self, 'done', False):\n"
+                         "            return None\n"
+                         "        self.done = True\n"
+                         "        return Order(side='UP', size=ot_helper_mod.SIZE, limit=0.99)\n")
+            root = build_archive(self.root)
+            sizes, prints = [], []
+            for size in (5, 7):
+                with open(os.path.join(d, "ot_helper_mod.py"), "w") as fh:
+                    fh.write(f"SIZE = {size}\n")
+                r = run_template(d, root)
+                sizes.append(r.fills[0]["requested"])
+                prints.append(r.report["fingerprint"]["sha256"])
+            self.assertEqual(sizes, [5, 7])
+            self.assertNotEqual(prints[0], prints[1])
+        finally:
+            sys.path.remove(d)
+            sys.modules.pop("ot_helper_mod", None)
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_two_strategy_directories_with_a_same_named_helper_each_run_their_own(self):
+        import json as _json
+        dirs = [tempfile.mkdtemp(prefix=f"ot-helper-{i}-") for i in range(2)]
+        root = build_archive(self.root)
+        try:
+            sizes = []
+            for d, size in zip(dirs, (5, 7)):
+                with open(os.path.join(d, "outcometick.json"), "w") as fh:
+                    _json.dump({"schema": 1, "language": "python@3.14", "entry": "strategy.py:S",
+                                "hooks": ["on_tick"], "datasets": ["settlement", "book"]}, fh)
+                with open(os.path.join(d, "ot_shared_helper.py"), "w") as fh:
+                    fh.write(f"SIZE = {size}\n")
+                with open(os.path.join(d, "strategy.py"), "w") as fh:
+                    fh.write("from outcometick import Order, Strategy\n"
+                             "import ot_shared_helper\n"
+                             "class S(Strategy):\n"
+                             "    def on_tick(self, ctx, tick):\n"
+                             "        if getattr(self, 'done', False):\n"
+                             "            return None\n"
+                             "        self.done = True\n"
+                             "        return Order(side='UP', size=ot_shared_helper.SIZE, limit=0.99)\n")
+                sys.path.insert(0, d)
+                sizes.append(run_template(d, root).fills[0]["requested"])
+            self.assertEqual(sizes, [5, 7])
+        finally:
+            for d in dirs:
+                if d in sys.path:
+                    sys.path.remove(d)
+                shutil.rmtree(d, ignore_errors=True)
+            sys.modules.pop("ot_shared_helper", None)
 
     def test_losing_side_settles_at_zero(self):
         r = run(BuyOnce, build_archive(self.root, outcome="DOWN"), assets=["BTC"])

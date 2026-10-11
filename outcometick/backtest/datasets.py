@@ -10,6 +10,7 @@ read order, so a different order is a different report.
 from __future__ import annotations
 
 import datetime as _dt
+import math
 
 from ._contract import CONTRACT
 from .taxonomy import classify_path
@@ -281,6 +282,33 @@ def normalize_feed_latency(value):
     return int(value)
 
 
+QUEUE_PROB_FUNCS = ("power", "power2", "power3", "log", "log2")
+
+
+def normalize_queue_model(value):
+    """normalizeQueueModel in api/lib/backtest-datasets.mjs."""
+    if value is None:
+        return None
+    bad = ManifestError('queue_model must be {"prob": "power"|"power2"|"power3", "n": 1..10} or '
+                        '{"prob": "log"|"log2"}, got ' + _json(value))
+    if not isinstance(value, dict):
+        raise bad
+    prob = value.get("prob")
+    if prob not in QUEUE_PROB_FUNCS:
+        raise bad
+    if prob.startswith("power"):
+        if any(k not in ("prob", "n") for k in value):
+            raise bad
+        n = value.get("n")
+        # A whole number by value, as JS's Number.isInteger: 2.0 from a JSON file is 2.
+        if not _num(n) or not math.isfinite(n) or n != int(n) or not 1 <= n <= 10:
+            raise bad
+        return {"prob": prob, "n": int(n)}
+    if any(k != "prob" for k in value):
+        raise bad
+    return {"prob": prob, "n": None}
+
+
 def engine_policy_for(manifest, venue, data="archive"):
     """enginePolicyFor in api/lib/backtest-datasets.mjs."""
     fok = normalize_fok(manifest.get("fok"))
@@ -289,9 +317,11 @@ def engine_policy_for(manifest, venue, data="archive"):
     guard = normalize_quote_guard(manifest.get("quote_guard"))
     mirror = normalize_mirror_depth(manifest.get("mirror_depth"))
     feed_latency = normalize_feed_latency(manifest.get("feed_latency"))
+    queue = normalize_queue_model(manifest.get("queue_model"))
     timers = "on_timer" in (manifest.get("hooks") or [])
     is_global = timers or feed_latency is not None
-    if not fok and rules is None and rebate is None and guard is None and mirror is None and not is_global:
+    if not fok and rules is None and rebate is None and guard is None and mirror is None and not is_global \
+            and queue is None:
         return None
     order_rules = None
     if rules == "venue":
@@ -312,6 +342,9 @@ def engine_policy_for(manifest, venue, data="archive"):
     if mirror is not None and data == "archive" and venue == "polymarket":
         raise ManifestError('mirror_depth "shared" is for single-book markets (Predict.fun); Polymarket publishes two '
                             'separate books')
+    if queue is not None and data == "archive" and venue != "polymarket":
+        raise ManifestError(f"queue_model is for resting (gtc) orders, which need a trade stream; the {venue} archive "
+                            "has none")
     return {
         "fok": fok,
         "order_rules": order_rules,
@@ -320,4 +353,5 @@ def engine_policy_for(manifest, venue, data="archive"):
         "mirror_depth": mirror,
         "mirror_markets": None if mirror is None else ("all" if data == "archive" else "single_mirrored"),
         **({"scheduler": "global", "timers": timers, "feed_latency": feed_latency or 0} if is_global else {}),
+        **({"queue_prob": queue} if queue is not None else {}),
     }

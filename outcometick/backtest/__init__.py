@@ -39,7 +39,7 @@ import tempfile
 from ._contract import CONTRACT
 from .datasets import (
     ManifestError, engine_policy_for, normalize_feed_latency, normalize_fok, normalize_intervals, normalize_maker_rebate,
-    normalize_mirror_depth, normalize_order_rules, normalize_quote_guard, resting_policy_for,
+    normalize_mirror_depth, normalize_order_rules, normalize_queue_model, normalize_quote_guard, resting_policy_for,
 )
 from .decode import BookThrottle, bbo_coverage, build_coverage, count_market_days, count_streams, sort_markets_for_replay
 from .feed import _dumps as _feed_dumps, market_lines, session_lines
@@ -170,7 +170,8 @@ def _hooks_of(klass) -> list:
 def run(strategy, data, *, venue=None, assets=None, days=None, datasets=None, intervals=None,
         params=None, mode="market", latency_ms=0, fee_bps=None, seed=1, hooks=None,
         cancel_latency_ms=None, cache=True, workers=None, mark_max_age_ms=None, fok=False, order_rules=None,
-        maker_rebate=None, quote_guard=None, mirror_depth=None, book_throttle=None, feed_latency=None) -> Result:
+        maker_rebate=None, quote_guard=None, mirror_depth=None, book_throttle=None, feed_latency=None,
+        queue_model=None) -> Result:
     """Backtest `strategy` (a class) over an unpacked archive at `data` -- or
     over your own data for ANY Polymarket binary market: a `Dataset`, or a
     directory with markets.json / markets.jsonl and CLOB frame files.
@@ -193,6 +194,10 @@ def run(strategy, data, *, venue=None, assets=None, days=None, datasets=None, in
                   (hooks fire late and ctx.book() lags; orders still match the
                   venue's book). on_timer + ctx.schedule() wake the strategy
                   at chosen times.
+    queue_model   resting orders: where unexplained book decreases came from in
+                  the queue -- {"prob": "power", "n": 2} (power/power2/power3,
+                  n 1..10) or {"prob": "log"} (log/log2). None: the conservative
+                  default (cancellations behind the order).
     book_throttle False: replay the archive's book unthinned (local only); True
                   or False also writes coverage.book_throttle
 
@@ -240,6 +245,7 @@ def run(strategy, data, *, venue=None, assets=None, days=None, datasets=None, in
         **({"quote_guard": quote_guard} if quote_guard is not None else {}),
         **({"mirror_depth": mirror_depth} if mirror_depth is not None else {}),
         **({"feed_latency": feed_latency} if feed_latency is not None else {}),
+        **({"queue_model": queue_model} if queue_model is not None else {}),
     }
     return _run(manifest, lambda: strategy, data=data, venue=venue, assets=assets, days=days, seed=seed, cache=cache,
                 workers=workers, mark_max_age_ms=mark_max_age_ms, book_throttle=book_throttle)
@@ -296,7 +302,8 @@ def run_template(path, data, *, venue=None, assets=None, days=None, seed=1, fee_
         "fee_bps": fee_bps if fee_bps is not None else doc.get("fee_bps"),
         "mode": doc.get("mode") or "market",
         "params": dict(doc.get("params") or {}),
-        **{k: doc[k] for k in ("fok", "order_rules", "maker_rebate", "quote_guard", "mirror_depth", "feed_latency")
+        **{k: doc[k] for k in ("fok", "order_rules", "maker_rebate", "quote_guard", "mirror_depth", "feed_latency",
+                                    "queue_model")
            if k in doc},
     }
     return _run(manifest, lambda: klass, data=data, venue=venue, assets=assets, days=days, seed=seed, cache=cache,
@@ -340,6 +347,7 @@ def _validate(manifest) -> None:
         normalize_quote_guard(manifest.get("quote_guard"))
         normalize_mirror_depth(manifest.get("mirror_depth"))
         normalize_feed_latency(manifest.get("feed_latency"))
+        normalize_queue_model(manifest.get("queue_model"))
     except ManifestError as err:
         raise BacktestError("E_MANIFEST", str(err)) from None
 
@@ -548,7 +556,8 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, wo
             trades=trades,
             fill_summary=summary,
             maker=maker_report(stats=result.get("maker"), fills=summary["makerFills"],
-                               queue_model=_ENGINE["otmaker"].QUEUE_MODEL,
+                               queue_model=_ENGINE["otmaker"].queue_model_name((policy or {}).get("queue_prob")),
+                               queue_prob=(policy or {}).get("queue_prob"),
                                print_lag_ms=_ENGINE["otmaker"].PRINT_LAG_MS),
             orders=orders_report(policy=policy, stats=result.get("orders")),
             timers=result.get("timers") if policy and policy.get("timers") else None,
@@ -690,7 +699,8 @@ def _run_generic(manifest, get_class, *, data, venue, days, seed, workers, mark_
             trades=trades,
             fill_summary=summary,
             maker=maker_report(stats=result.get("maker"), fills=summary["makerFills"],
-                               queue_model=_ENGINE["otmaker"].QUEUE_MODEL,
+                               queue_model=_ENGINE["otmaker"].queue_model_name((policy or {}).get("queue_prob")),
+                               queue_prob=(policy or {}).get("queue_prob"),
                                print_lag_ms=_ENGINE["otmaker"].PRINT_LAG_MS),
             orders=orders_report(policy=policy, stats=result.get("orders")),
             timers=result.get("timers") if policy and policy.get("timers") else None,

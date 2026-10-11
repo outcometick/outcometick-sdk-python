@@ -387,7 +387,7 @@ def fill_stats(fills):
     return {"count": len(fills), "slippage": slippage(fills), "makerFills": maker.result()}
 
 
-def maker_report(*, stats, fills, queue_model, print_lag_ms):
+def maker_report(*, stats, fills, queue_model, print_lag_ms, queue_prob=None):
     """makerReport in runner/engine/report.mjs."""
     if not stats or not stats.get("submitted", 0) > 0:
         return None
@@ -398,6 +398,7 @@ def maker_report(*, stats, fills, queue_model, print_lag_ms):
     s = stats
     return {
         "queue_model": queue_model,
+        **({"queue_prob": {"prob": queue_prob["prob"], "n": queue_prob.get("n")}} if queue_prob else {}),
         "print_lag_ms": print_lag_ms,
         "orders": {
             "submitted": s["submitted"],

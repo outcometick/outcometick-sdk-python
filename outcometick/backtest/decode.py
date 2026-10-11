@@ -33,7 +33,7 @@ def _coalesce(*vals):
 
 def _get(obj, key):
     """`obj?.key` for a JSON value: None unless obj is an object with the key."""
-    return obj.get(key) if isinstance(obj, dict) else None
+    return obj.get(key) if type(obj) is dict or isinstance(obj, dict) else None
 
 
 def _interval_label(seconds):

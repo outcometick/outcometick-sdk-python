@@ -77,11 +77,24 @@ def js_number(v) -> float:
     return math.nan
 
 
+# The shape nearly every archived number has: a plain decimal with no
+# whitespace, sign other than minus, exponent or radix prefix. For these,
+# JavaScript's Number(s) is exactly float(s), so the general path below — trim,
+# radix check, the full grammar — is skipped. Anything else takes that path.
+_PLAIN_DECIMAL = re.compile(r"-?[0-9]+(?:\.[0-9]+)?", re.ASCII)
+
+
 def num(v):
     """`num` in runner/events.mjs: a finite number, or None.
 
     An empty or blank string is None, not 0 -- the reason this exists.
     """
+    t = type(v)
+    if t is str and _PLAIN_DECIMAL.fullmatch(v):
+        n = float(v)
+        return n if math.isfinite(n) else None
+    if t is float:
+        return v if math.isfinite(v) else None
     if v is None:
         return None
     if isinstance(v, str) and js_trim(v) == "":
@@ -133,6 +146,8 @@ def _number_to_string(x: float) -> str:
 
 def js_string(v) -> str:
     """`String(v)` for JSON values."""
+    if type(v) is str:
+        return v
     if v is None:
         return "null"
     if isinstance(v, bool):

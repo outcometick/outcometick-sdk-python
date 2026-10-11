@@ -18,7 +18,7 @@ import tempfile
 import unittest
 
 from outcometick import Order, Strategy
-from outcometick.backtest import BacktestError, run
+from outcometick.backtest import BacktestError, run, sweep
 
 T0 = 1788825600000  # 2026-09-08T00:00:00Z
 UP_TOKEN, DOWN_TOKEN = "1" * 70, "2" * 70
@@ -266,3 +266,414 @@ class Cases(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def build_multi_archive(root, markets=6, day="2026-09-08", t0=T0):
+    """`markets` consecutive BTC 5-minute markets, each with a book and its ticks."""
+    T0 = t0  # noqa: N806 -- the module constant, shifted for another day
+    raw = {"cryptoMarketConfig": {"twapLookbackSeconds": 60}, "feesEnabled": True,
+           "feeSchedule": {"rate": 0.07, "exponent": 1, "takerOnly": True, "rebateRate": 0.2}}
+    rows, books = [], []
+    for i in range(markets):
+        start = T0 + i * 300_000
+        slug = f"btc-updown-5m-m{i}"
+        up, down = str(i + 1) * 70, str(i + 1) * 69 + "9"
+        rows.append({"slug": slug, "asset": "btc", "interval_sec": 300, "condition_id": "0x" + f"{i:02x}" * 32,
+                     "token_ids": [up, down], "start_sec": start // 1000, "end_sec": start // 1000 + 300,
+                     "resolved": True, "outcome_prices": ["1", "0"] if i % 2 == 0 else ["0", "1"],
+                     "strike_value": "79104869058460346482688", "raw": raw})
+        for token, a, b in ((up, [(0.50, 60)], [(0.48, 100)]), (down, [(0.53, 100)], [(0.47, 100)])):
+            books.append({"slug": slug, "asset_id": token, "event_type": "book", "event_ts_ms": start + 1000,
+                          "recv_ms": start + 1000,
+                          "payload": {"asks": [{"price": str(p), "size": str(s)} for p, s in a],
+                                      "bids": [{"price": str(p), "size": str(s)} for p, s in b]}})
+    _write(root, f"data/polymarket/daily/markets/BTC-5m/BTC-5m-markets-{day}.jsonl.gz", rows)
+    _write(root, f"data/polymarket/daily/book/BTC-5m/BTC-5m-book-{day}.jsonl.gz", books)
+    _write(root, f"data/chainlink-twap-60s/daily/prices/BTCUSD/BTCUSD-twap60s-prices-{day}.csv.gz",
+           [[T0 + s * 1000, 79100 + s % 50, "0", T0 + s * 1000, T0 + s * 1000] for s in range(5, markets * 300, 7)],
+           csv_header=["feed_ts_ms", "value", "full_accuracy_value", "server_ts_ms", "recv_ms"])
+    return root
+
+
+class Chatty(Strategy):
+    """Logs every tick — with trailing whitespace, which the harness strips from
+    what it prints but still charges to the log budget — and trades once a market."""
+
+    def on_market_open(self, ctx, market):
+        self.done = False
+
+    def on_tick(self, ctx, tick):
+        ctx.log(f"tick {tick.value} {'x' * (tick.ts_ms % 40)}   ")
+        if self.done:
+            return None
+        self.done = True
+        return Order(side="UP" if tick.value % 2 else "DOWN", size=10, limit=0.99)
+
+
+class Parallel(unittest.TestCase):
+    """workers > 1 replays markets on separate processes; the result must be the
+    sequential one, byte for byte — rows, totals and the run-wide log budget."""
+
+    def setUp(self):
+        self.root = build_multi_archive(tempfile.mkdtemp(prefix="ot-bt-par-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def both(self, klass, **kw):
+        seq = run(klass, self.root, assets=["BTC"], workers=1, cache=False, **kw)
+        par = run(klass, self.root, assets=["BTC"], workers=4, cache=False, **kw)
+        return seq, par
+
+    def same(self, seq, par):
+        strip = lambda r: {k: v for k, v in r.report.items() if k != "budget"}  # noqa: E731
+        self.assertEqual(strip(seq), strip(par))
+        self.assertEqual(seq.trades, par.trades)
+        self.assertEqual(seq.fills, par.fills)
+        self.assertEqual(seq.logs, par.logs)
+
+    def test_rows_and_totals_match_the_sequential_run(self):
+        seq, par = self.both(Chatty)
+        self.assertEqual(seq.report["scanned"]["markets"], 6)
+        self.assertGreater(len(seq.trades), 3)
+        self.same(seq, par)
+
+    def test_the_run_wide_log_budget_is_cut_at_the_same_line(self):
+        from outcometick.backtest._contract import CONTRACT
+        limits = CONTRACT["limits"]
+        saved = limits["logBytesPerRun"]
+        # Small enough to run out in the third market or so.
+        limits["logBytesPerRun"] = 6000
+        try:
+            seq, par = self.both(Chatty)
+        finally:
+            limits["logBytesPerRun"] = saved
+        self.assertIn("[runner] log budget spent", seq.logs)
+        self.same(seq, par)
+
+
+class SizedSide(Strategy):
+    """One order per market, side and size from params."""
+
+    def on_market_open(self, ctx, market):
+        self.done = False
+
+    def on_tick(self, ctx, tick):
+        if self.done:
+            return None
+        self.done = True
+        return Order(side=ctx.p.side, size=ctx.p.size, limit=0.99)
+
+
+class Sweeps(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="ot-bt-sweep-")
+        build_multi_archive(self.root, markets=4, day="2026-09-08", t0=T0)
+        build_multi_archive(self.root, markets=4, day="2026-09-09", t0=T0 + 86_400_000)
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_cells_are_plain_runs_ranked_with_a_held_out_replay(self):
+        grid = {"side": ["UP", "DOWN"], "size": [5, 10]}
+        s = sweep(SizedSide, self.root, grid, assets=["BTC"], holdout=0.5, top=2, workers=2)
+        self.assertEqual(s.in_days, ["2026-09-08"])
+        self.assertEqual(s.out_days, ["2026-09-09"])
+        self.assertEqual(len(s.cells), 4)
+        for c in s.cells:
+            direct = run(SizedSide, self.root, assets=["BTC"], days=["2026-09-08"], params=c["params"], workers=1)
+            self.assertEqual(c["metrics"], direct.metrics, c["params"])
+        pnls = [c["metrics"]["net_pnl"] for c in s.ranked]
+        self.assertEqual(pnls, sorted(pnls, reverse=True))
+        held = [c for c in s.ranked if c["holdout"] is not None]
+        self.assertEqual([c["params"] for c in held], [c["params"] for c in s.ranked[:2]])
+        for c in held:
+            direct = run(SizedSide, self.root, assets=["BTC"], days=["2026-09-09"], params=c["params"], workers=1)
+            self.assertEqual(c["holdout"], direct.metrics)
+        self.assertIn("held out 2026-09-09", s.summary())
+
+    def test_smaller_is_better_metrics_rank_ascending(self):
+        s = sweep(SizedSide, self.root, {"side": ["UP", "DOWN"], "size": [5, 10]}, assets=["BTC"],
+                  metric="max_drawdown_abs")
+        vals = [c["metrics"]["max_drawdown_abs"] for c in s.ranked]
+        self.assertEqual(vals, sorted(vals))
+        self.assertIn("No days were held out", s.summary())
+
+    def test_bad_sweeps_are_refused(self):
+        with self.assertRaises(BacktestError):
+            sweep(SizedSide, self.root, {}, assets=["BTC"])
+        with self.assertRaises(BacktestError):
+            sweep(SizedSide, self.root, {"size": []}, assets=["BTC"])
+        with self.assertRaises(BacktestError):
+            sweep(SizedSide, self.root, {"size": [5]}, assets=["BTC"], params={"side": "UP"}, holdout=0.99)
+        with self.assertRaises(BacktestError):
+            sweep(SizedSide, self.root, {"size": [5]}, assets=["BTC"], params={"side": "UP"}, metric="nope")
+
+
+class CountsMarkets(Strategy):
+    """Keeps a counter on the CLASS — outside the market-mode contract, but a
+    sequential run carries it across markets, so a parallel one must too."""
+    seen = 0
+
+    def on_market_open(self, ctx, market):
+        type(self).seen += 1
+        self.done = False
+
+    def on_tick(self, ctx, tick):
+        if self.done:
+            return None
+        self.done = True
+        return Order(side="UP" if type(self).seen % 3 else "DOWN", size=type(self).seen, limit=0.99)
+
+
+class Once:
+    """A log message that may be formatted exactly once, as Ctx.log formats it."""
+
+    def __init__(self, n):
+        self.n = n
+        self.formatted = False
+
+    def __str__(self):
+        if self.formatted:
+            raise RuntimeError("formatted twice")
+        self.formatted = True
+        return f"once#{self.n}  "
+
+
+class LogsObjects(Strategy):
+    def on_market_open(self, ctx, market):
+        self.k = 0
+
+    def on_tick(self, ctx, tick):
+        self.k += 1
+        ctx.log(Once(self.k))
+        return None
+
+
+class MutatesParams(Strategy):
+    def on_market_open(self, ctx, market):
+        ctx.p.seen.append(1)
+        self.done = False
+
+    def on_tick(self, ctx, tick):
+        if self.done:
+            return None
+        self.done = True
+        return Order(side="UP", size=len(ctx.p.seen), limit=0.99)
+
+
+class ParallelContract(unittest.TestCase):
+    def setUp(self):
+        self.root = build_multi_archive(tempfile.mkdtemp(prefix="ot-bt-par2-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def same(self, seq, par):
+        strip = lambda r: {k: v for k, v in r.report.items() if k != "budget"}  # noqa: E731
+        self.assertEqual(strip(seq), strip(par))
+        self.assertEqual(seq.trades, par.trades)
+        self.assertEqual(seq.fills, par.fills)
+        self.assertEqual(seq.logs, par.logs)
+
+    def test_state_on_the_class_falls_back_to_a_sequential_replay(self):
+        CountsMarkets.seen = 0
+        seq = run(CountsMarkets, self.root, assets=["BTC"], workers=1, cache=False)
+        CountsMarkets.seen = 0
+        par = run(CountsMarkets, self.root, assets=["BTC"], workers=4, cache=False)
+        self.assertGreater(len({t["size"] for t in seq.trades}), 3, "the counter did not carry across markets")
+        self.same(seq, par)
+
+    def test_mutable_params_fall_back_to_a_sequential_replay(self):
+        seq = run(MutatesParams, self.root, assets=["BTC"], workers=1, cache=False, params={"seen": []})
+        par = run(MutatesParams, self.root, assets=["BTC"], workers=4, cache=False, params={"seen": []})
+        self.same(seq, par)
+
+    def test_a_log_message_is_formatted_once_and_the_parent_is_left_alone(self):
+        from outcometick.backtest import _ENGINE
+        before = _ENGINE["otreplay"].Ctx.log
+        seq = run(LogsObjects, self.root, assets=["BTC"], workers=1, cache=False)
+        par = run(LogsObjects, self.root, assets=["BTC"], workers=4, cache=False)
+        # The cost of a line is read off the line Ctx.log stored: a second
+        # str(msg) would raise in Once and fail the run.
+        self.assertIs(_ENGINE["otreplay"].Ctx.log, before)
+        self.assertIn("once#1", seq.logs)
+        self.same(seq, par)
+
+
+class Flag:
+    """Formatting this message flips the strategy's own side — a side effect
+    Ctx.log stops having once the run's log budget is spent."""
+
+    def __init__(self, owner):
+        self.owner = owner
+
+    def __str__(self):
+        self.owner.side = "DOWN" if self.owner.side == "UP" else "UP"
+        return "x" * 200
+
+
+class TradesOnItsLog(Strategy):
+    def on_market_open(self, ctx, market):
+        self.side, self.n = "UP", 0
+
+    def on_tick(self, ctx, tick):
+        self.n += 1
+        ctx.log(Flag(self))
+        if self.n == 5:
+            return Order(side=self.side, size=10, limit=0.99)
+        return None
+
+
+class ParallelBudget(unittest.TestCase):
+    def setUp(self):
+        self.root = build_multi_archive(tempfile.mkdtemp(prefix="ot-bt-par3-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_a_spent_log_budget_changes_behaviour_and_the_run_falls_back(self):
+        from outcometick.backtest._contract import CONTRACT
+        limits = CONTRACT["limits"]
+        saved = limits["logBytesPerRun"]
+        limits["logBytesPerRun"] = 4000  # spent during the second market
+        try:
+            seq = run(TradesOnItsLog, self.root, assets=["BTC"], workers=1, cache=False)
+            par = run(TradesOnItsLog, self.root, assets=["BTC"], workers=4, cache=False)
+        finally:
+            limits["logBytesPerRun"] = saved
+        # Once the budget is gone the side stops flipping, so later markets trade
+        # a different side than the first one did.
+        self.assertGreater(len({t["side"] for t in seq.trades}), 1)
+        self.assertEqual(seq.trades, par.trades)
+        self.assertEqual(seq.fills, par.fills)
+        self.assertEqual(seq.logs, par.logs)
+
+
+class HoldsALambda(Strategy):
+    """Class state that cannot be pickled, mutated in place across markets."""
+    state = {"seen": 0, "callback": lambda: None}
+
+    def on_market_open(self, ctx, market):
+        type(self).state["seen"] += 1
+        self.done = False
+
+    def on_tick(self, ctx, tick):
+        if self.done:
+            return None
+        self.done = True
+        return Order(side="UP", size=type(self).state["seen"], limit=0.99)
+
+
+def add_price_changes(root, rows, day="2026-09-08"):
+    _write(root, f"data/polymarket/daily/price_change/BTC-5m/BTC-5m-price_change-{day}.jsonl.gz", rows)
+
+
+def price_change(ts, changes, slug="btc-updown-5m-m0"):
+    return {"slug": slug, "asset_id": None, "event_type": "price_change", "event_ts_ms": ts, "recv_ms": ts,
+            "payload": {"price_changes": changes}}
+
+
+class ParallelEdges(unittest.TestCase):
+    def setUp(self):
+        self.root = build_multi_archive(tempfile.mkdtemp(prefix="ot-bt-par4-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_unpicklable_class_state_runs_sequentially(self):
+        HoldsALambda.state["seen"] = 0
+        seq = run(HoldsALambda, self.root, assets=["BTC"], workers=1, cache=False)
+        HoldsALambda.state["seen"] = 0
+        par = run(HoldsALambda, self.root, assets=["BTC"], workers=4, cache=False)
+        self.assertEqual(seq.trades, par.trades)
+        self.assertGreater(len({t["size"] for t in seq.trades}), 3)
+
+    def test_a_bad_row_the_throttle_drops_is_dropped_in_parallel_too(self):
+        good = {"asset_id": "1" * 70, "side": "BUY", "price": "0.49", "size": "10", "best_bid": "0.49", "best_ask": "0.50"}
+        # BTC's throttle on this day is 20 ms: the second row is dropped by it
+        # before its payload is read — sequentially it never fails.
+        add_price_changes(self.root, [price_change(T0 + 2000, [good]), price_change(T0 + 2005, [good, None]),
+                                      price_change(T0 + 3000, [good])])
+        seq = run(BuyOnce, self.root, assets=["BTC"], workers=1, cache=False)
+        par = run(BuyOnce, self.root, assets=["BTC"], workers=4, cache=False)
+        self.assertEqual(seq.fills, par.fills)
+
+    def test_a_bad_row_the_throttle_keeps_fails_both_ways(self):
+        good = {"asset_id": "1" * 70, "side": "BUY", "price": "0.49", "size": "10", "best_bid": "0.49", "best_ask": "0.50"}
+        add_price_changes(self.root, [price_change(T0 + 2000, [good]), price_change(T0 + 2500, [good, None])])
+        errors = []
+        for w in (1, 4):
+            with self.assertRaises(Exception) as cm:
+                run(BuyOnce, self.root, assets=["BTC"], workers=w, cache=False)
+            errors.append(type(cm.exception))
+        self.assertEqual(errors[0], errors[1])
+
+
+class NestedState(Strategy):
+    """State on a class defined inside the strategy."""
+
+    class State:
+        seen = 0
+
+    def on_market_open(self, ctx, market):
+        type(self).State.seen += 1
+        self.done = False
+
+    def on_tick(self, ctx, tick):
+        if self.done:
+            return None
+        self.done = True
+        return Order(side="UP", size=type(self).State.seen, limit=0.99)
+
+
+class ParallelNested(unittest.TestCase):
+    def setUp(self):
+        self.root = build_multi_archive(tempfile.mkdtemp(prefix="ot-bt-par5-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_state_on_a_nested_class_falls_back_too(self):
+        NestedState.State.seen = 0
+        seq = run(NestedState, self.root, assets=["BTC"], workers=1, cache=False)
+        NestedState.State.seen = 0
+        par = run(NestedState, self.root, assets=["BTC"], workers=4, cache=False)
+        self.assertGreater(len({t["size"] for t in seq.trades}), 3)
+        self.assertEqual(seq.trades, par.trades)
+
+    def test_by_default_only_decoding_is_parallel(self):
+        CountsMarkets.seen = 0
+        seq = run(CountsMarkets, self.root, assets=["BTC"], workers=1, cache=False)
+        CountsMarkets.seen = 0
+        default = run(CountsMarkets, self.root, assets=["BTC"], cache=False)
+        self.assertEqual(seq.trades, default.trades)
+
+
+class ConcurrentRuns(unittest.TestCase):
+    """Two run() calls at once in one process, each decoding in parallel, must
+    not see each other's archive."""
+
+    def test_two_threads_decoding_different_archives(self):
+        import threading
+        a = build_multi_archive(tempfile.mkdtemp(prefix="ot-bt-ta-"), markets=5)
+        b = build_multi_archive(tempfile.mkdtemp(prefix="ot-bt-tb-"), markets=3)
+        try:
+            want = {k: run(Chatty, root, assets=["BTC"], workers=1, cache=False).trades for k, root in (("a", a), ("b", b))}
+            got, errors = {}, []
+
+            def go(k, root):
+                try:
+                    got[k] = run(Chatty, root, assets=["BTC"], cache=False).trades
+                except Exception as err:  # noqa: BLE001
+                    errors.append(err)
+            threads = [threading.Thread(target=go, args=x) for x in (("a", a), ("b", b))] * 1
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join()
+            self.assertEqual(errors, [])
+            self.assertEqual(got, want)
+        finally:
+            shutil.rmtree(a, ignore_errors=True)
+            shutil.rmtree(b, ignore_errors=True)

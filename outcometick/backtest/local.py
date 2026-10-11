@@ -8,14 +8,18 @@ events a queued run does.
 
 from __future__ import annotations
 
+import base64
+import concurrent.futures
 import gzip
 import io
 import json
 import os
+import pickle
 import re
 import tempfile
+import threading
 
-from ._js import json_loads, js_trim
+from ._js import json_loads, js_string, js_trim
 from .datasets import (
     archive_datasets_for_day, file_matches_run, normalize_intervals, ordered_feed, settlement_paths_for,
 )
@@ -123,17 +127,37 @@ def jsonify(v):
     reach the strategy as 1788796800000.0 instead of 1788796800000 and every
     `ctx.log` line that prints one would differ.
     """
-    if isinstance(v, float):
+    t = type(v)
+    if t is float:
         if v == 0:
             return 0
         if v.is_integer() and abs(v) < 1e21:
             return int(v)
         return v
+    if t is dict:
+        # Strings, ints, bools and None come back as they went in, and a float
+        # is converted inline, so neither costs a call — most of an event's
+        # values, and most of the decode time this used to cost. The float rule
+        # is the one above, spelled out.
+        return {k: x if type(x) in _AS_IS else (
+            (0 if x == 0 else int(x) if x.is_integer() and -1e21 < x < 1e21 else x)
+            if type(x) is float else jsonify(x)) for k, x in v.items()}
+    if t is list:
+        return [x if type(x) in _AS_IS else (
+            (0 if x == 0 else int(x) if x.is_integer() and -1e21 < x < 1e21 else x)
+            if type(x) is float else jsonify(x)) for x in v]
+    if t in _AS_IS:
+        return v
+    if isinstance(v, float):
+        return jsonify(float(v))
     if isinstance(v, dict):
         return {k: jsonify(x) for k, x in v.items()}
     if isinstance(v, list):
         return [jsonify(x) for x in v]
     return v
+
+
+_AS_IS = frozenset((str, int, bool, type(None)))
 
 
 def _dump(ev) -> str:
@@ -206,46 +230,265 @@ def spool_day(*, day, markets, by_slug, throttle, events_dir, feed, rows_of, boo
     try:
         for market_id, market in markets.items():
             events = []
+            # The text each event was spooled as, by object: it is already the
+            # final JSON (dumps of a loads of it gives the same bytes), so the
+            # kept events are written back verbatim instead of encoded again.
+            raw = {}
             if market_id in counts:
                 with open(parts[market_id], encoding="utf-8") as fh:
                     for line in fh:
                         if line.strip():
                             try:
-                                events.append(json.loads(line))
+                                ev = json.loads(line)
                             except ValueError:
-                                pass
+                                continue
+                            events.append(ev)
+                            raw[id(ev)] = line if line.endswith("\n") else line + "\n"
                 _rm(parts[market_id])
-            fin = finalise_market(events, market, book_factory) if market else {"events": [], "up_px": None, "down_px": None}
-            why = market_unusable(market, fin["events"])
-            if why:
-                unusable.append({"market_id": market_id, "asset": (market or {}).get("asset"), "day": day, "why": why})
-                continue
-            fd, events_file = tempfile.mkstemp(prefix=f"{day}-", suffix=".jsonl", dir=events_dir)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                for e in fin["events"]:
-                    fh.write(_dump(e) + "\n")
-            out.append({
-                "market": {
-                    "market_id": market["market_id"],
-                    "asset": market["asset"],
-                    "interval": market["interval"],
-                    "strike": market["strike"],
-                    "outcome": market["outcome"],
-                    "open_ts_ms": market["open_ts_ms"],
-                    "close_ts_ms": market["close_ts_ms"],
-                    # Polymarket only, like the JS: a Predict record has no `fee`.
-                    **({"fee": market["fee"]} if "fee" in market else {}),
-                },
-                "events_file": events_file,
-                "stream": market["stream"],
-                "day": day,
-                "up_px": fin["up_px"],
-                "down_px": fin["down_px"],
-            })
+            kind, entry = _finish_market(market_id, market, events, raw, day=day, events_dir=events_dir,
+                                         book_factory=book_factory)
+            (out if kind == "out" else unusable).append(entry)
     except BaseException:
         for p in parts.values():
             _rm(p)
         raise
+    return {"out": out, "unusable": unusable, "bbo_seen": bbo_seen}
+
+
+def _finish_market(market_id, market, events, raw, *, day, events_dir, book_factory):
+    """Order, cut and check one market's spooled events; write its event file.
+
+    `raw` maps id(event) to the line it was spooled as. Shared by the sequential
+    and the parallel spool, so the two cannot drift.
+    """
+    fin = finalise_market(events, market, book_factory) if market else {"events": [], "up_px": None, "down_px": None}
+    why = market_unusable(market, fin["events"])
+    if why:
+        return "unusable", {"market_id": market_id, "asset": (market or {}).get("asset"), "day": day, "why": why}
+    fd, events_file = tempfile.mkstemp(prefix=f"{day}-", suffix=".jsonl", dir=events_dir)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        for e in fin["events"]:
+            fh.write(raw[id(e)])
+    return "out", {
+        "market": {
+            "market_id": market["market_id"],
+            "asset": market["asset"],
+            "interval": market["interval"],
+            "strike": market["strike"],
+            "outcome": market["outcome"],
+            "open_ts_ms": market["open_ts_ms"],
+            "close_ts_ms": market["close_ts_ms"],
+            # Polymarket only, like the JS: a Predict record has no `fee`.
+            **({"fee": market["fee"]} if "fee" in market else {}),
+        },
+        "events_file": events_file,
+        "stream": market["stream"],
+        "day": day,
+        "up_px": fin["up_px"],
+        "down_px": fin["down_px"],
+    }
+
+
+# --- the same spool, on several processes ----------------------------------
+#
+# Two phases, both deterministic, and the output is the sequential spool's,
+# byte for byte (client/backtest/tests: Parallel; equivalence.test.mjs).
+#
+#  1. STRIPES. Worker k reads every file of the day but parses only the
+#     non-blank data lines whose index is k mod N (decompressing is cheap; the
+#     JSON parse and the event building are what cost). Each event is written,
+#     tagged with (file index, line index, position in the row) and its market,
+#     to one of B bucket files by market. The book throttle is STATEFUL per
+#     market and order-dependent, so it is not applied here: every row that
+#     consults it leaves a marker (j = -1) with the timestamp it was consulted
+#     with — even a row that then yields no event, because consulting it still
+#     moves the throttle.
+#  2. BUCKETS. Each bucket's markets are rebuilt from all stripes in exactly
+#     the sequential order (file, line, position), the throttle is replayed on
+#     the markers from the state the run's throttle already had, and each market
+#     is finished by the same _finish_market the sequential spool uses. The
+#     throttle state of the bucket's markets goes back to the parent, so the
+#     next day starts where a sequential run would.
+
+_PSTATE: dict = {}
+# The children read _PSTATE as it was at fork time, and the pool forks lazily,
+# as tasks are submitted: one run's state must stay put for its pool's whole
+# life. Concurrent run() calls in one process take turns here.
+_PSTATE_LOCK = threading.Lock()
+
+
+def _striped_rows(root, rel, k, n):
+    full = os.path.join(root, rel)
+    opener = gzip.open if rel.endswith(".gz") else open
+    is_csv = ".csv" in rel
+    with opener(full, "rb") as raw, io.TextIOWrapper(raw, encoding="utf-8", errors="replace", newline=None) as fh:
+        header = None
+        idx = -1
+        for line in fh:
+            s = js_trim(line)
+            if not s:
+                continue
+            if is_csv and header is None:
+                header = s.split(",")
+                continue
+            idx += 1
+            if idx % n != k:
+                continue
+            row = parse_row(s, is_csv=is_csv, header=header, loads=json_loads)
+            if row is not None:
+                yield idx, row
+
+
+class _ThrottleProbe:
+    """Stands in for the throttle in phase 1: keeps everything, remembers who asked."""
+
+    def __init__(self, dataset):
+        self.dataset = dataset
+        self.calls = []
+
+    def keep(self, ds, market_id, ts, asset):
+        if ds == self.dataset:
+            self.calls.append((market_id, ts))
+        return True
+
+
+def _stripe(k):
+    st = _PSTATE
+    n, markets, bucket = st["n"], st["markets"], st["bucket"]
+    paths = [os.path.join(st["dir"], f"s{k}-b{b}.part") for b in range(st["buckets"])]
+    bufs = [[] for _ in paths]
+    handles = [open(p, "w", encoding="utf-8") for p in paths]
+    bbo_seen = set()
+    probe = _ThrottleProbe(st["throttle"].dataset if st["throttle"] is not None else None)
+    try:
+        for f_idx, f in enumerate(st["feed"]):
+            meta = classify_path(f)
+            if meta["dataset"] == "markets":
+                continue
+            for line_no, row in _striped_rows(st["root"], f, k, n):
+                probe.calls = []
+                try:
+                    evs = events_from_row(f, row, markets, st["by_slug"],
+                                          probe if st["throttle"] is not None else None, meta)
+                except Exception as err:  # noqa: BLE001
+                    if not probe.calls:
+                        raise
+                    # Thrown AFTER the row consulted the throttle: sequentially
+                    # it is thrown only if the throttle keeps this row. Carried
+                    # on the marker and decided in phase 2.
+                    blob = base64.b64encode(pickle.dumps(err)).decode()
+                    for mid, ts in probe.calls:
+                        key = str(mid)
+                        if key in markets:
+                            bufs[bucket[key]].append(
+                                f"{f_idx} {line_no} -1\t{key}\t{json.dumps({'ts': ts, 'err': blob})}\n")
+                    continue
+                for mid, ts in probe.calls:
+                    key = str(mid)
+                    if key in markets:
+                        b = bucket[key]
+                        bufs[b].append(f"{f_idx} {line_no} -1\t{key}\t{json.dumps(ts)}\n")
+                for j, (mid, ev) in enumerate(evs):
+                    if ev.get("bbo"):
+                        bbo_seen.add(_market_day_key(markets.get(mid)))
+                    key = str(mid)
+                    if key not in markets:
+                        continue
+                    b = bucket[key]
+                    bufs[b].append(f"{f_idx} {line_no} {j}\t{key}\t{_dump(ev)}\n")
+                    if len(bufs[b]) >= 4096:
+                        handles[b].write("".join(bufs[b]))
+                        bufs[b] = []
+        for b, h in enumerate(handles):
+            if bufs[b]:
+                h.write("".join(bufs[b]))
+    finally:
+        for h in handles:
+            h.close()
+    return bbo_seen
+
+
+def _merge_bucket(b):
+    st = _PSTATE
+    markets, throttle = st["markets"], st["throttle"]
+    recs: dict = {}
+    for k in range(st["n"]):
+        path = os.path.join(st["dir"], f"s{k}-b{b}.part")
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                head, key, payload = line.rstrip("\n").split("\t", 2)
+                f_idx, line_no, j = head.split(" ")
+                recs.setdefault(key, []).append((int(f_idx), int(line_no), int(j), payload))
+        _rm(path)
+    results = []
+    for market_id in st["bucket_markets"][b]:
+        market = markets[market_id]
+        items = recs.get(market_id, [])
+        items.sort(key=lambda r: (r[0], r[1], r[2]))
+        events, raw = [], {}
+        dropped_row = None
+        for f_idx, line_no, j, payload in items:
+            if j == -1:
+                mark = json.loads(payload)
+                err = None
+                if isinstance(mark, dict):
+                    mark, err = mark["ts"], mark["err"]
+                kept = throttle.keep(throttle.dataset, market_id, mark, market["asset"])
+                if kept and err is not None:
+                    raise pickle.loads(base64.b64decode(err))
+                dropped_row = None if kept else (f_idx, line_no)
+                continue
+            if dropped_row == (f_idx, line_no):
+                continue
+            ev = json.loads(payload)
+            events.append(ev)
+            raw[id(ev)] = payload + "\n"
+        results.append((market_id, _finish_market(market_id, market, events, raw, day=st["day"],
+                                                  events_dir=st["events_dir"], book_factory=st["book_factory"])))
+    last = {}
+    if throttle is not None:
+        for market_id in st["bucket_markets"][b]:
+            key = js_string(market_id)
+            if key in throttle._last:
+                last[key] = throttle._last[key]
+    return results, last
+
+
+def spool_day_parallel(*, day, markets, by_slug, throttle, events_dir, feed, root, book_factory, workers, ctx):
+    """spool_day, on `workers` processes. Same output, same throttle state after."""
+    os.makedirs(events_dir, exist_ok=True)
+    work = tempfile.mkdtemp(prefix=f"{day}-par-", dir=events_dir)
+    ids = list(markets)
+    buckets = max(1, min(len(ids), 128))
+    bucket = {mid: i % buckets for i, mid in enumerate(ids)}
+    bucket_markets = [[mid for i, mid in enumerate(ids) if i % buckets == b] for b in range(buckets)]
+    _PSTATE_LOCK.acquire()
+    _PSTATE.clear()
+    _PSTATE.update(n=workers, markets=markets, by_slug=by_slug, throttle=throttle, feed=feed, root=root,
+                   dir=work, buckets=buckets, bucket=bucket, bucket_markets=bucket_markets, day=day,
+                   events_dir=events_dir, book_factory=book_factory)
+    try:
+        # ProcessPoolExecutor rather than multiprocessing.Pool: a worker that is
+        # killed (out of memory, say) raises BrokenProcessPool here instead of
+        # leaving the run waiting forever for a result that will not come.
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
+            seen_sets = list(pool.map(_stripe, range(workers)))
+            merged = list(pool.map(_merge_bucket, range(buckets)))
+    finally:
+        _PSTATE.clear()
+        _PSTATE_LOCK.release()
+        _shutil.rmtree(work, ignore_errors=True)
+    bbo_seen = set().union(*seen_sets) if seen_sets else set()
+    by_market = {}
+    for results, last in merged:
+        for market_id, res in results:
+            by_market[market_id] = res
+        if throttle is not None:
+            throttle._last.update(last)
+    out, unusable = [], []
+    for market_id in ids:
+        kind, entry = by_market[market_id]
+        (out if kind == "out" else unusable).append(entry)
     return {"out": out, "unusable": unusable, "bbo_seen": bbo_seen}
 
 
@@ -256,7 +499,8 @@ def _rm(p):
         pass
 
 
-def load_local_day(*, root, day, venue, assets, datasets, intervals, throttle, events_dir, book_factory):
+def load_local_day(*, root, day, venue, assets, datasets, intervals, throttle, events_dir, book_factory,
+                   workers=1, ctx=None):
     archive_datasets = archive_datasets_for_day(datasets=datasets, venue=venue, day=day, frm=day, to=day)
     want_intervals = normalize_intervals(intervals)
     all_paths = walk(root)
@@ -287,8 +531,13 @@ def load_local_day(*, root, day, venue, assets, datasets, intervals, throttle, e
     feed = ordered_feed(wanted + settlement_paths_for(
         list(markets.values()), day_paths, venue=venue, assets=assets, already=wanted))
 
-    spooled = spool_day(day=day, markets=markets, by_slug=by_slug, throttle=throttle, events_dir=events_dir,
-                        feed=feed, rows_of=lambda rel: read_rows(root, rel), book_factory=book_factory)
+    if workers > 1 and ctx is not None and len(markets) > 1:
+        spooled = spool_day_parallel(day=day, markets=markets, by_slug=by_slug, throttle=throttle,
+                                     events_dir=events_dir, feed=feed, root=root, book_factory=book_factory,
+                                     workers=workers, ctx=ctx)
+    else:
+        spooled = spool_day(day=day, markets=markets, by_slug=by_slug, throttle=throttle, events_dir=events_dir,
+                            feed=feed, rows_of=lambda rel: read_rows(root, rel), book_factory=book_factory)
     out, unusable = spooled["out"], spooled["unusable"]
     reason = None
     if not out and unusable:

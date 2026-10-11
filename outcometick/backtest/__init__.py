@@ -39,10 +39,12 @@ import tempfile
 from ._contract import CONTRACT
 from .datasets import ManifestError, normalize_intervals, resting_policy_for
 from .decode import BookThrottle, bbo_coverage, build_coverage, count_market_days, count_streams, sort_markets_for_replay
-from .feed import market_lines, session_lines
+from .feed import _dumps as _feed_dumps, market_lines, session_lines
+from ._parallel import SharedState, default_workers, fork_context, replay_markets
 from .local import archive_venues, default_venue, load_local_day, load_local_day_cached, local_days, looks_like_archive
 from .report import build_report, fee_model_report, fill_stats, maker_report, parse_fill, parse_trade
 from .sample import load_sample
+from .sweep import SweepResult, sweep
 
 from ._engine import load as _load_engine
 
@@ -53,7 +55,7 @@ _H = _ENGINE["otharness"]
 CHANNEL_FILL, CHANNEL_LOG, CHANNEL_PROGRESS = _H.CHANNEL_FILL, _H.CHANNEL_LOG, _H.CHANNEL_PROGRESS
 CHANNEL_RESULT, CHANNEL_TRADE, EXIT_OK, run_job = _H.CHANNEL_RESULT, _H.CHANNEL_TRADE, _H.EXIT_OK, _H.run_job
 
-__all__ = ["run", "run_template", "load_sample", "Result", "BacktestError"]
+__all__ = ["run", "run_template", "sweep", "load_sample", "Result", "SweepResult", "BacktestError"]
 
 HOOKS = ("on_market_open", "on_tick", "on_book", "on_trade", "on_settle")
 _EMITTING = ("on_tick", "on_book", "on_trade")
@@ -160,7 +162,7 @@ def _hooks_of(klass) -> list:
 
 def run(strategy, data, *, venue=None, assets=None, days=None, datasets=None, intervals=None,
         params=None, mode="market", latency_ms=0, fee_bps=None, seed=1, hooks=None,
-        cancel_latency_ms=None, cache=True) -> Result:
+        cancel_latency_ms=None, cache=True, workers=None) -> Result:
     """Backtest `strategy` (a class) over an unpacked archive at `data`.
 
     assets    default BTC, ETH, SOL, XRP (as `ot run`); name others to include them.
@@ -173,6 +175,12 @@ def run(strategy, data, *, venue=None, assets=None, days=None, datasets=None, in
               datasets to include "book" and "trades", and Polymarket.
     cache     keep decoded days under ~/.cache/outcometick/decoded (or a path),
               so the next run over the same days starts at once. False: never.
+    workers   None (default): decode on every CPU core, replay in this process —
+              always the single-process result. A number: decode AND replay
+              markets on that many processes (market mode). Parallel replay
+              relies on market mode's contract: a strategy keeps its state on
+              the instance. State found on its class (nested classes included)
+              or in params makes the run replay in one process instead.
     """
     if not isinstance(strategy, type):
         raise TypeError("pass the strategy CLASS, not an instance")
@@ -196,10 +204,12 @@ def run(strategy, data, *, venue=None, assets=None, days=None, datasets=None, in
         "mode": mode,
         "params": dict(params or getattr(strategy, "params", None) or {}),
     }
-    return _run(manifest, lambda: strategy, data=data, venue=venue, assets=assets, days=days, seed=seed, cache=cache)
+    return _run(manifest, lambda: strategy, data=data, venue=venue, assets=assets, days=days, seed=seed, cache=cache,
+                workers=workers)
 
 
-def run_template(path, data, *, venue=None, assets=None, days=None, seed=1, fee_bps=None, cache=True) -> Result:
+def run_template(path, data, *, venue=None, assets=None, days=None, seed=1, fee_bps=None, cache=True,
+                 workers=None) -> Result:
     """Run a strategy directory (outcometick.json + source), like `ot run`."""
     import importlib.util
     import json
@@ -250,7 +260,8 @@ def run_template(path, data, *, venue=None, assets=None, days=None, seed=1, fee_
         "mode": doc.get("mode") or "market",
         "params": dict(doc.get("params") or {}),
     }
-    return _run(manifest, lambda: klass, data=data, venue=venue, assets=assets, days=days, seed=seed, cache=cache)
+    return _run(manifest, lambda: klass, data=data, venue=venue, assets=assets, days=days, seed=seed, cache=cache,
+                workers=workers)
 
 
 def _validate(manifest) -> None:
@@ -314,7 +325,7 @@ def _cache_root(cache):
     return os.path.join(base, "outcometick", "decoded")
 
 
-def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True) -> Result:
+def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, workers=None) -> Result:
     root = os.fspath(data)
     if not looks_like_archive(root):
         raise BacktestError("E_DATA", f"{os.path.abspath(root)} does not look like an archive — "
@@ -334,13 +345,15 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True) ->
     scope_assets = asset_list or list(_DEFAULT_ASSETS)
 
     cache_root = _cache_root(cache)
+    n_workers = default_workers() if workers is None else max(1, int(workers))
     events_dir = tempfile.mkdtemp(prefix="ot-events-")
     try:
         markets, missing, bbo_applied = [], [], {}
         throttle = BookThrottle(venue=venue, assets=scope_assets, frm=want_days[0], to=want_days[-1])
         for day in want_days:
             kw = dict(root=root, day=day, venue=venue, assets=scope_assets, datasets=manifest["datasets"],
-                      intervals=manifest["intervals"], throttle=throttle, book_factory=lambda: _Book(None))
+                      intervals=manifest["intervals"], throttle=throttle, book_factory=lambda: _Book(None),
+                      workers=n_workers, ctx=fork_context())
             try:
                 if cache_root:
                     loaded = load_local_day_cached(cache_root=cache_root, engine_file=_ENGINE["otengine"].__file__, **kw)
@@ -413,7 +426,23 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True) ->
                     raise RunAbort("E_HOOK_SIG", f"{h} was declared but {h}() is not defined on the class")
             return klass
 
-        code = run_job(job, load_class, next_line, emit)
+        # Replay is parallel only when asked for (see `workers` in run()):
+        # decoding never runs strategy code, replaying does.
+        parallel = (workers is not None and manifest["mode"] == "market" and n_workers > 1
+                    and len(markets) > 1 and fork_context() is not None)
+        if parallel:
+            try:
+                code, out_lines = replay_markets(
+                    workers=min(n_workers, len(markets)), markets=markets, job=job, load_class=load_class,
+                    get_class=get_class, lines_of=lines_of, header_of=header_of, run_job=run_job,
+                    dumps=_feed_dumps, engine=_ENGINE,
+                    channels={"log": CHANNEL_LOG, "result": CHANNEL_RESULT, "progress": CHANNEL_PROGRESS})
+            except SharedState:
+                # The strategy keeps state on its class or in params, which a
+                # sequential run carries across markets: replay it that way.
+                parallel = False
+        if not parallel:
+            code = run_job(job, load_class, next_line, emit)
         trades, fills, logs, result, malformed = _demux(out_lines)
         if code != EXIT_OK:
             rej = result.get("rejection") or {"code": "E_RUNTIME", "detail": f"exited {code}"}

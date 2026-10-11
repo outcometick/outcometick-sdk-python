@@ -42,7 +42,7 @@ import tempfile
 from ._contract import CONTRACT
 from .datasets import (
     ManifestError, engine_policy_for, normalize_feed_latency, normalize_fok, normalize_intervals, normalize_maker_rebate,
-    normalize_mirror_depth, normalize_order_rules, normalize_queue_model, normalize_quote_guard, resting_policy_for,
+    normalize_mirror_depth, normalize_order_rules, normalize_queue_model, normalize_quote_guard, normalize_record_ms, resting_policy_for,
 )
 from .decode import BookThrottle, bbo_coverage, build_coverage, count_market_days, count_streams, sort_markets_for_replay
 from .feed import _dumps as _feed_dumps, market_lines, session_lines
@@ -50,7 +50,7 @@ from ._parallel import SharedState, default_workers, fork_context, replay_market
 from .local import archive_venues, default_venue, load_local_day, load_local_day_cached, local_days, looks_like_archive
 from .report import (
     MARKET_COLUMNS, REJECT_REASONS, build_report, fee_model_report, fill_stats, maker_report, market_rows,
-    orders_report, parse_fill, parse_trade,
+    orders_report, parse_fill, parse_record, parse_trade, record_report,
 )
 from .fingerprint import (
     dataset_digest_of_dir, fingerprint_of_files, inputs_digest, local_inputs, memory_dataset_digest, read_submission,
@@ -92,11 +92,16 @@ class BacktestError(RuntimeError):
 class Result:
     """A finished backtest: the report plus every trade, fill and log line."""
 
-    def __init__(self, report: dict, trades: list, fills: list, logs: str, markets: list | None = None):
+    def __init__(self, report: dict, trades: list, fills: list, logs: str, markets: list | None = None,
+                 record: dict | None = None):
         self.report = report
         self.trades = trades
         self.fills = fills
         self.logs = logs
+        # The time-grid mark-to-market (record_ms): the account's points and the
+        # per-instance samples they were built from (record.csv / record_markets.csv).
+        self.record = (record or {}).get("points") or []
+        self.record_markets = (record or {}).get("samples") or []
         # One row per market replayed, entered or not -- markets.csv in a
         # hosted or `ot run` archive (report.MARKET_COLUMNS).
         self.markets = markets if markets is not None else []
@@ -109,6 +114,11 @@ class Result:
         """Trades as a pandas DataFrame (needs pandas)."""
         import pandas as pd
         return pd.DataFrame(self.trades)
+
+    def record_df(self):
+        """The account on the record grid as a pandas DataFrame (needs pandas)."""
+        import pandas as pd
+        return pd.DataFrame(self.record, columns=["ts", "value", "position_value", "open_positions"])
 
     def markets_df(self):
         """Every market replayed, entered or not, as a pandas DataFrame (needs pandas)."""
@@ -188,7 +198,7 @@ def run(strategy, data, *, venue=None, assets=None, days=None, datasets=None, in
         params=None, mode="market", latency_ms=0, fee_bps=None, seed=1, hooks=None,
         cancel_latency_ms=None, cache=True, workers=None, mark_max_age_ms=None, fok=False, order_rules=None,
         maker_rebate=None, quote_guard=None, mirror_depth=None, book_throttle=None, feed_latency=None,
-        queue_model=None) -> Result:
+        queue_model=None, record_ms=None) -> Result:
     """Backtest `strategy` (a class) over an unpacked archive at `data` -- or
     over your own data for ANY Polymarket binary market: a `Dataset`, or a
     directory with markets.json / markets.jsonl and CLOB frame files.
@@ -215,6 +225,9 @@ def run(strategy, data, *, venue=None, assets=None, days=None, datasets=None, in
                   the queue -- {"prob": "power", "n": 2} (power/power2/power3,
                   n 1..10) or {"prob": "log"} (log/log2). None: the conservative
                   default (cancellations behind the order).
+    record_ms     the account's value every record_ms milliseconds (1000..3600000),
+                  each market's open legs at the best bid: Result.record,
+                  report["record"] (market mode only)
     book_throttle False: replay the archive's book unthinned (local only); True
                   or False also writes coverage.book_throttle
 
@@ -263,6 +276,7 @@ def run(strategy, data, *, venue=None, assets=None, days=None, datasets=None, in
         **({"mirror_depth": mirror_depth} if mirror_depth is not None else {}),
         **({"feed_latency": feed_latency} if feed_latency is not None else {}),
         **({"queue_model": queue_model} if queue_model is not None else {}),
+        **({"record_ms": record_ms} if record_ms is not None else {}),
     }
     return _run(manifest, lambda: strategy, data=data, venue=venue, assets=assets, days=days, seed=seed, cache=cache,
                 workers=workers, mark_max_age_ms=mark_max_age_ms, book_throttle=book_throttle)
@@ -373,7 +387,7 @@ def _run_template_rest(path, data, doc, snapshot, klass, file_name, class_name, 
         "mode": doc.get("mode") or "market",
         "params": dict(doc.get("params") or {}),
         **{k: doc[k] for k in ("fok", "order_rules", "maker_rebate", "quote_guard", "mirror_depth", "feed_latency",
-                                    "queue_model")
+                                    "queue_model", "record_ms")
            if k in doc},
     }
     result = _run(manifest, lambda: klass, data=data, venue=venue, assets=assets, days=days, seed=seed, cache=cache,
@@ -481,6 +495,7 @@ def _validate(manifest) -> None:
         normalize_mirror_depth(manifest.get("mirror_depth"))
         normalize_feed_latency(manifest.get("feed_latency"))
         normalize_queue_model(manifest.get("queue_model"))
+        normalize_record_ms(manifest.get("record_ms"))
     except ManifestError as err:
         raise BacktestError("E_MANIFEST", str(err)) from None
 
@@ -621,8 +636,11 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, wo
             with open(m["events_file"], encoding="utf-8") as fh:
                 return [line.strip() for line in fh if line.strip()]
 
+        instance_of = ({id(m): i for i, m in enumerate(markets)} if (policy or {}).get("record_ms") else None)
+
         def header_of(m):
-            return {"market": m["market"], "stream": m["stream"]}
+            return {"market": m["market"], "stream": m["stream"],
+                    **({"instance": instance_of[id(m)]} if instance_of is not None else {})}
 
         if manifest["mode"] == "session":
             stream = session_lines(markets, lines_of=lines_of, header_of=header_of,
@@ -668,14 +686,17 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, wo
                     workers=min(n_workers, len(markets)), markets=markets, job=job, load_class=load_class,
                     get_class=get_class, lines_of=lines_of, header_of=header_of, run_job=run_job,
                     dumps=_feed_dumps, engine=_ENGINE,
-                    channels={"log": CHANNEL_LOG, "result": CHANNEL_RESULT, "progress": CHANNEL_PROGRESS})
+                    channels={"log": CHANNEL_LOG, "result": CHANNEL_RESULT, "progress": CHANNEL_PROGRESS,
+                              "record": _H.CHANNEL_RECORD})
             except SharedState:
                 # The strategy keeps state on its class or in params, which a
                 # sequential run carries across markets: replay it that way.
                 parallel = False
         if not parallel:
             code = run_job(job, load_class, next_line, emit)
-        trades, fills, logs, result, malformed = _demux(out_lines)
+        trades, fills, logs, result, malformed, records = _demux(out_lines)
+        rec = record_report(samples=records, record_ms=(policy or {}).get("record_ms"), harness=result.get("record"),
+                            max_rows=_H.MAX_RECORD_ROWS)
         if code != EXIT_OK:
             rej = result.get("rejection") or {"code": "E_RUNTIME", "detail": f"exited {code}"}
             raise BacktestError(rej.get("code", "E_RUNTIME"), rej.get("detail", ""))
@@ -716,6 +737,7 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, wo
                                print_lag_ms=_ENGINE["otmaker"].PRINT_LAG_MS),
             orders=orders_report(policy=policy, stats=result.get("orders")),
             timers=result.get("timers") if policy and policy.get("timers") else None,
+            record=rec["block"],
             market_summaries=list(meta.values()),
             market_meta=meta,
             fees_paid=result["fees_paid"],
@@ -743,7 +765,7 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, wo
             gate = BookThrottle(venue=venue, assets=scope_assets, frm=want_days[0], to=want_days[-1])
             report["coverage"]["book_throttle"] = ("off" if book_throttle is False
                                                   else {a: gate.window_for(a) for a in scope_assets})
-        return Result(report, trades, fills, logs, market_rows(trades, meta))
+        return Result(report, trades, fills, logs, market_rows(trades, meta), record=rec)
     finally:
         shutil.rmtree(events_dir, ignore_errors=True)
 
@@ -800,8 +822,11 @@ def _run_generic(manifest, get_class, *, data, venue, days, seed, workers, mark_
             from .generic import file_lines
             return file_lines(m["events_file"])
 
+        instance_of = ({id(m): i for i, m in enumerate(markets)} if (policy or {}).get("record_ms") else None)
+
         def header_of(m):
-            return {"market": m["market"], "stream": m["stream"], "terminal": m.get("terminal")}
+            return {"market": m["market"], "stream": m["stream"], "terminal": m.get("terminal"),
+                    **({"instance": instance_of[id(m)]} if instance_of is not None else {})}
 
         if manifest["mode"] == "session":
             stream = session_lines(markets, lines_of=lines_of, header_of=header_of, cursor_of=cursor_of,
@@ -831,7 +856,9 @@ def _run_generic(manifest, get_class, *, data, venue, days, seed, workers, mark_
                                    seed=seed, data="generic", fee_bps_override=fee_bps_override,
                                    data_sha256=_dataset_sha256(dataset), replay={"mark_max_age_ms": mark_max_age_ms})
         code = run_job(job, load_class, next_line, emit)
-        trades, fills, logs, result, malformed = _demux(out_lines)
+        trades, fills, logs, result, malformed, records = _demux(out_lines)
+        rec = record_report(samples=records, record_ms=(policy or {}).get("record_ms"), harness=result.get("record"),
+                            max_rows=_H.MAX_RECORD_ROWS)
         if code != EXIT_OK:
             rej = result.get("rejection") or {"code": "E_RUNTIME", "detail": f"exited {code}"}
             raise BacktestError(rej.get("code", "E_RUNTIME"), rej.get("detail", ""))
@@ -867,6 +894,7 @@ def _run_generic(manifest, get_class, *, data, venue, days, seed, workers, mark_
                                print_lag_ms=_ENGINE["otmaker"].PRINT_LAG_MS),
             orders=orders_report(policy=policy, stats=result.get("orders")),
             timers=result.get("timers") if policy and policy.get("timers") else None,
+            record=rec["block"],
             market_summaries=list(meta.values()),
             market_meta=meta,
             fees_paid=result["fees_paid"],
@@ -892,7 +920,7 @@ def _run_generic(manifest, get_class, *, data, venue, days, seed, workers, mark_
         )
         report = apply_generic_extras(report, generic_report_extras(
             trades=trades, markets=markets, unusable=decoded["unusable"], counts=decoded["counts"]))
-        return Result(report, trades, fills, logs, market_rows(trades, meta))
+        return Result(report, trades, fills, logs, market_rows(trades, meta), record=rec)
     finally:
         shutil.rmtree(events_dir, ignore_errors=True)
 
@@ -901,7 +929,7 @@ def _demux(lines):
     """Split the harness output by channel, validating rows like `ot run` does."""
     import json
 
-    trades, fills, logs = [], [], []
+    trades, fills, logs, records = [], [], [], []
     malformed = 0
     result = None
     for channel, payload in lines:
@@ -921,12 +949,19 @@ def _demux(lines):
         except ValueError:
             malformed += 1
             continue
+        if channel == _H.CHANNEL_RECORD:
+            rec = parse_record(raw)
+            if rec is None:
+                malformed += 1
+            else:
+                records.append(rec)
+            continue
         row = parse_trade(raw) if channel == CHANNEL_TRADE else parse_fill(raw) if channel == CHANNEL_FILL else None
         if row is None:
             malformed += 1
             continue
         (trades if channel == CHANNEL_TRADE else fills).append(row)
-    return trades, fills, "\n".join(logs), _parse_result(result or {}), malformed
+    return trades, fills, "\n".join(logs), _parse_result(result or {}), malformed, records
 
 
 def _order_stats(raw, fin):
@@ -952,6 +987,10 @@ def _parse_result(r: dict) -> dict:
         "orders": _order_stats(r.get("orders"), fin),
         "timers": ({k: (r["timers"].get(k) if fin(r["timers"].get(k)) else 0) for k in ("created", "fired", "dropped")}
                    if isinstance(r.get("timers"), dict) else None),
+        "record": ({"rows": r["record"]["rows"] if fin(r["record"].get("rows")) else 0,
+                    "bytes": r["record"]["bytes"] if fin(r["record"].get("bytes")) else 0,
+                    "truncated": r["record"].get("truncated") is True}
+                   if isinstance(r.get("record"), dict) else None),
         "crosschecks": [{
             "market_id": c["market_id"] if isinstance(c.get("market_id"), str) else None,
             "claimed": c.get("claimed"),

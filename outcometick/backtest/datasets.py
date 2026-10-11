@@ -282,6 +282,20 @@ def normalize_feed_latency(value):
     return int(value)
 
 
+RECORD_MS_MIN = 1000
+RECORD_MS_MAX = 3_600_000
+
+
+def normalize_record_ms(value):
+    """normalizeRecordMs in api/lib/backtest-datasets.mjs."""
+    if value is None:
+        return None
+    if not _num(value) or not math.isfinite(value) or value != int(value) or not RECORD_MS_MIN <= value <= RECORD_MS_MAX:
+        raise ManifestError(f"record_ms must be a whole number of milliseconds between {RECORD_MS_MIN} and "
+                            f"{RECORD_MS_MAX}, got {_json(value)}")
+    return int(value)
+
+
 QUEUE_PROB_FUNCS = ("power", "power2", "power3", "log", "log2")
 
 
@@ -318,10 +332,11 @@ def engine_policy_for(manifest, venue, data="archive"):
     mirror = normalize_mirror_depth(manifest.get("mirror_depth"))
     feed_latency = normalize_feed_latency(manifest.get("feed_latency"))
     queue = normalize_queue_model(manifest.get("queue_model"))
+    record_ms = normalize_record_ms(manifest.get("record_ms"))
     timers = "on_timer" in (manifest.get("hooks") or [])
     is_global = timers or feed_latency is not None
     if not fok and rules is None and rebate is None and guard is None and mirror is None and not is_global \
-            and queue is None:
+            and queue is None and record_ms is None:
         return None
     order_rules = None
     if rules == "venue":
@@ -342,6 +357,9 @@ def engine_policy_for(manifest, venue, data="archive"):
     if mirror is not None and data == "archive" and venue == "polymarket":
         raise ManifestError('mirror_depth "shared" is for single-book markets (Predict.fun); Polymarket publishes two '
                             'separate books')
+    if record_ms is not None and (manifest.get("mode") or "market") != "market":
+        raise ManifestError('record_ms needs mode "market": in a session one portfolio is shared by every market, and '
+                            'this recorder samples one market at a time')
     if queue is not None and data == "archive" and venue != "polymarket":
         raise ManifestError(f"queue_model is for resting (gtc) orders, which need a trade stream; the {venue} archive "
                             "has none")
@@ -354,4 +372,5 @@ def engine_policy_for(manifest, venue, data="archive"):
         "mirror_markets": None if mirror is None else ("all" if data == "archive" else "single_mirrored"),
         **({"scheduler": "global", "timers": timers, "feed_latency": feed_latency or 0} if is_global else {}),
         **({"queue_prob": queue} if queue is not None else {}),
+        **({"record_ms": record_ms} if record_ms is not None else {}),
     }

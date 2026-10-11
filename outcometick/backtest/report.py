@@ -447,6 +447,104 @@ def fill_stats(fills):
             "activity": activity.result()}
 
 
+RECORD_VALUATION = "liquidation at the best bid; a leg with no bid counts 0; quotes are not checked for freshness"
+
+
+def account_series(samples, record_ms, *, max_rows=math.inf):
+    """accountSeries in runner/engine/report.mjs."""
+    n = len(samples)
+    if not n or not record_ms > 0:
+        return {"truncated": False, "points": []}
+    first = math.inf
+    last = -math.inf
+    for x in samples:
+        if x["ts"] < first:
+            first = x["ts"]
+        if x["final"] and x["ts"] > last:
+            last = x["ts"]
+    if last == -math.inf:
+        for x in samples:
+            if x["ts"] > last:
+                last = x["ts"]
+    g0 = math.ceil(first / record_ms) * record_ms
+    grid_count = max(0, math.floor(last / record_ms) - math.ceil(first / record_ms) + 1)
+    total = grid_count + (0 if last % record_ms == 0 else 1)
+    if n + total > max_rows:
+        return {"truncated": True, "points": []}
+    order = sorted(range(n), key=lambda i: (samples[i]["ts"], i))
+    latest = {}
+    st = {"value": 0, "position": 0, "open": 0, "i": 0}
+    points = []
+
+    def advance_to(t):
+        while st["i"] < n and samples[order[st["i"]]]["ts"] <= t:
+            x = samples[order[st["i"]]]
+            v = (x["cash"] + x["marked"]) + x["position_value"]
+            prev = latest.get(x["key"])
+            if prev is not None:
+                st["value"] += v - prev[0]
+                st["position"] += x["position_value"] - prev[1]
+                if prev[1] > 0:
+                    st["open"] -= 1
+            else:
+                st["value"] += v
+                st["position"] += x["position_value"]
+            if x["position_value"] > 0:
+                st["open"] += 1
+            latest[x["key"]] = (v, x["position_value"])
+            st["i"] += 1
+        points.append({"ts": t, "value": st["value"], "position_value": st["position"], "open_positions": st["open"]})
+    for k in range(grid_count):
+        advance_to(g0 + k * record_ms)
+    if last % record_ms != 0:
+        advance_to(last)
+    return {"truncated": False, "points": points}
+
+
+def record_report(*, samples, record_ms, harness, max_rows=math.inf):
+    """recordReport in runner/engine/report.mjs."""
+    if not record_ms:
+        return {"block": None, "points": [], "samples": []}
+    if not harness or harness.get("truncated"):
+        return {"block": {"interval_ms": record_ms, "truncated": True}, "points": [], "samples": []}
+    series = account_series(samples, record_ms, max_rows=max_rows)
+    if series["truncated"]:
+        return {"block": {"interval_ms": record_ms, "truncated": True}, "points": [], "samples": []}
+    pts = series["points"]
+    peak = max_dd = 0
+    dd_at = None
+    worst = None
+    max_pos = sum_pos = 0
+    for p in pts:
+        if p["value"] > peak:
+            peak = p["value"]
+        if peak - p["value"] > max_dd:
+            max_dd = peak - p["value"]
+            dd_at = p["ts"]
+        if worst is None or p["value"] < worst[1]:
+            worst = (p["ts"], p["value"])
+        if p["position_value"] > max_pos:
+            max_pos = p["position_value"]
+        sum_pos += p["position_value"]
+    return {
+        "block": {
+            "interval_ms": record_ms,
+            "truncated": False,
+            "valuation": RECORD_VALUATION,
+            "points": len(pts),
+            "instances": len({x["key"] for x in samples}),
+            "final_value": r2(pts[-1]["value"]) if pts else None,
+            "max_drawdown_abs": r2(max_dd),
+            "max_drawdown_at": dd_at,
+            "worst_point": {"ts": worst[0], "value": r2(worst[1])} if worst else None,
+            "max_position_value": r2(max_pos),
+            "mean_position_value": r2(sum_pos / len(pts)) if pts else None,
+        },
+        "points": pts,
+        "samples": samples,
+    }
+
+
 MARKET_COLUMNS = (
     "market_id", "asset", "interval", "settlement", "open_ts_ms", "close_ts_ms", "strike", "outcome",
     "up_px", "down_px", "entered", "trades", "contracts", "net_pnl", "fees", "first_entry_ms",
@@ -661,7 +759,7 @@ def orders_report(*, policy, stats):
 def build_report(*, run_id, submitted_at, manifest, scope, source_sha256=None, trades, fill_summary,
                  market_summaries, market_meta, fees_paid=0, fill_delay_ms=0, fee_model=None, sweep=None,
                  coverage=None, crosschecks=(), budget=None, seed=None, scanned=None, maker=None, orders=None,
-                 timers=None, fingerprint=None):
+                 timers=None, fingerprint=None, record=None):
     closed = [t for t in trades if _finite(t.get("pnl"))]
     equity = equity_curve(closed)
     matched = sum(1 for c in crosschecks if c.get("match"))
@@ -706,6 +804,7 @@ def build_report(*, run_id, submitted_at, manifest, scope, source_sha256=None, t
         "maker": maker,
         **({"orders": orders} if orders else {}),
         **({"timers": timers} if timers else {}),
+        **({"record": record} if record else {}),
         "sweep": sweep,
         "coverage": coverage,
         "budget": budget,
@@ -774,6 +873,19 @@ def _generic_trade_fields(raw):
         "mark_age_ms": _num_or_none(raw.get("mark_age_ms")),
         "mark_missing": raw.get("mark_missing") if raw.get("mark_missing") in ("no_quote", "stale") else None,
     }
+
+
+def parse_record(raw):
+    """parseRecord in runner/harness/protocol.mjs."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("key"), str):
+        return None
+    for f in ("ts", "cash", "marked", "position_value"):
+        if not _finite(raw.get(f)):
+            return None
+    if not isinstance(raw.get("final"), bool):
+        return None
+    return {"key": raw["key"], "ts": raw["ts"], "cash": raw["cash"], "marked": raw["marked"],
+            "position_value": raw["position_value"], "final": raw["final"]}
 
 
 def parse_fill(raw):

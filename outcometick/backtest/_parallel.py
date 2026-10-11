@@ -182,6 +182,9 @@ def replay_markets(*, workers, markets, job, load_class, get_class, lines_of, he
 def _drain(pool, pending, n, window, job, channels, out_lines):
     """Merge shard results in market order, with at most `window` of them in flight."""
     ch_log, ch_result, ch_progress = channels["log"], channels["result"], channels["progress"]
+    ch_record = channels.get("record")
+    record_limit = _record_limits()[0]
+    record_kept = 0
     budget_bytes = (job.get("limits") or {}).get("logBytesPerRun")
     submitted = 0
     spent = 0
@@ -207,7 +210,13 @@ def _drain(pool, pending, n, window, job, channels, out_lines):
                 logs.append(payload)
             elif channel == ch_progress:
                 continue
+            elif channel == ch_record and record_kept >= record_limit:
+                # Past the run's row budget the record is cut anyway (_add_result
+                # marks it): not kept, so memory stays bounded across shards.
+                continue
             else:
+                if channel == ch_record:
+                    record_kept += 1
                 out_lines.append((channel, payload))
         for cost in costs:
             if budget_bytes is not None and spent >= budget_bytes:
@@ -220,6 +229,14 @@ def _drain(pool, pending, n, window, job, channels, out_lines):
         if code != 0:
             return total, code
     return total, 0
+
+
+def _record_limits():
+    h = _STATE.get("engine", {}).get("otharness") if _STATE else None
+    if h is None:
+        from ._engine import load
+        h = load()["otharness"]
+    return h.MAX_RECORD_ROWS, h.MAX_RECORD_BYTES
 
 
 def _add_result(total, r):
@@ -240,6 +257,15 @@ def _add_result(total, r):
         for k, v in (o.get("rejected") or {}).items():
             t["rejected"][k] = t["rejected"].get(k, 0) + (v or 0)
         t["rebates"] += o.get("rebates") or 0
+    # The recorder's budgets: summed in market order, and over either budget the
+    # sequential run would have stopped recording -- so this one says so too.
+    rc = r.get("record")
+    if isinstance(rc, dict):
+        t = total.setdefault("record", {"rows": 0, "bytes": 0, "truncated": False})
+        t["rows"] += rc.get("rows") or 0
+        t["bytes"] += rc.get("bytes") or 0
+        t["truncated"] = bool(t["truncated"] or rc.get("truncated")
+                              or t["rows"] > _record_limits()[0] or t["bytes"] > _record_limits()[1])
     # Timer counters (on_timer declared): absent otherwise, like the harness.
     tm = r.get("timers")
     if isinstance(tm, dict):

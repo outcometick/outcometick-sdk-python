@@ -550,6 +550,23 @@ class Parallel(unittest.TestCase):
         self.assertGreaterEqual(seq.report["orders"]["rejected"]["below_min_size"], 6)
         self.same(seq, par)
 
+    def test_the_record_is_the_same_in_parallel(self):
+        class Holder(Strategy):
+            def on_market_open(self, ctx, market):
+                self.done = False
+
+            def on_tick(self, ctx, tick):
+                if self.done:
+                    return None
+                self.done = True
+                return Order(side="UP", size=5, limit=0.99)
+        seq, par = self.both(Holder, record_ms=1000)
+        self.assertFalse(seq.report["record"]["truncated"])
+        self.assertGreater(len(seq.record), 3)
+        self.assertEqual(seq.record, par.record)
+        self.assertEqual(seq.record_markets, par.record_markets)
+        self.same(seq, par)
+
     def test_timer_counters_add_up_the_same_in_parallel(self):
         class Timed(Strategy):
             def on_market_open(self, ctx, market):

@@ -137,9 +137,9 @@ def _cells(run_cell, params_list, cell_workers, state):
     ctx = fork_context()
     # fork copies the calling thread only: a lock another thread held at that
     # moment (the engine's, a logging handler's) would stay locked in the child.
-    # os.waitid: on macOS from Python 3.13 only.
+    # os.waitid: on macOS from Python 3.13 only. signal.signal: main thread only.
     before = (state() if rest and cell_workers and cell_workers > 1 and ctx is not None
-              and hasattr(os, "waitid") and hasattr(signal, "pthread_sigmask")
+              and hasattr(os, "waitid") and threading.current_thread() is threading.main_thread()
               and threading.active_count() == 1 else None)
     if before is None:
         return done + [run_cell(p) for p in rest]
@@ -166,14 +166,18 @@ def _forked(run_cell, params, workers, state, before):
 
     def fork(i):
         # Ctrl-C held off from fork() until the cell is in `running`: an
-        # interrupt in between would leave a cell nobody kills or reaps.
-        old = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+        # interrupt in between would leave a cell nobody kills or reaps. Not a
+        # signal mask -- with any other OS thread alive the kernel delivers the
+        # SIGINT there and Python still raises it here -- but a handler that
+        # only notes it, then the previous one, given the same signal.
+        noted = []
+        previous = signal.signal(signal.SIGINT, lambda *a: noted.append(a))
         try:
             pid = os.fork()
             if pid == 0:
                 code = 1
                 try:
-                    signal.pthread_sigmask(signal.SIG_SETMASK, old)
+                    signal.signal(signal.SIGINT, previous)
                     os.setpgid(0, 0)
                     payload = pickle.dumps((run_cell(params[i]), state() != before), protocol=4)
                     with open(answer(i) + ".tmp", "wb") as fh:
@@ -190,7 +194,12 @@ def _forked(run_cell, params, workers, state, before):
                 pass  # it died already
             running[i] = pid
         finally:
-            signal.pthread_sigmask(signal.SIG_SETMASK, old)
+            signal.signal(signal.SIGINT, previous)
+            if noted:
+                if callable(previous):
+                    previous(*noted[0])  # the default one raises KeyboardInterrupt
+                elif previous == signal.SIG_DFL:
+                    os.kill(os.getpid(), signal.SIGINT)
 
     running = {}  # cell index -> pid
     accepted = []

@@ -842,6 +842,20 @@ class Sweeps(unittest.TestCase):
             os.waitpid(forked[0], 0)
             raise
 
+    def test_an_interrupt_just_after_fork_with_another_os_thread_alive(self):
+        # threading does not see a raw _thread, so the sweep still forks; the
+        # kernel hands a process-wide SIGINT to whichever thread does not block
+        # it, and Python raises it in the main thread wherever it happens to be.
+        import _thread
+        import time
+        stop = []
+        _thread.start_new_thread(lambda: [time.sleep(0.01) for _ in iter(lambda: bool(stop), True)], ())
+        try:
+            for _ in range(5):
+                self.test_an_interrupt_just_after_fork_still_kills_and_reaps_the_cell()
+        finally:
+            stop.append(1)
+
     def test_without_waitid_cells_run_here(self):
         pids = tempfile.mkdtemp(prefix="ot-bt-pids-")
         waitid = os.waitid

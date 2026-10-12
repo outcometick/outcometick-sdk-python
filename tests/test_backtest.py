@@ -146,6 +146,9 @@ class Cases(unittest.TestCase):
         self.assertAlmostEqual(r.fills[1]["filled"], 5.76, places=12)
         rules = r.report["orders"]["order_rules"]
         self.assertEqual((rules["mode"], rules["assumed_tick"], rules["assumed_min_size"]), ("assumed", 0.001, 5))
+        self.assertEqual(rules["note"], "archive markets do not carry their tick or minimum size: these are values "
+                         "measured on the archive, not read per market \u2014 a market quoting in 0.01 would refuse a "
+                         "0.001 limit accepted here, one quoting finer would accept limits refused here")
         self.assertNotIn("orders", run(BuyOnce, self.root, assets=["BTC"]).report, "off: no block, old bytes")
         with self.assertRaises(BacktestError):
             run(Small, self.root, assets=["BTC"], order_rules="venue")        # archive markets carry no tick

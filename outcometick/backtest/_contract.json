@@ -181,6 +181,9 @@
   "degrading_datasets": [
     "bbo"
   ],
+  "implied_datasets": {
+    "bbo": "book"
+  },
   "market_intervals": [
     "5m",
     "15m"
@@ -234,6 +237,6 @@
     "maxSweepCells": 256,
     "archiveRetentionDays": 7
   },
-  "sandbox_image_tag": "1.26.2",
+  "sandbox_image_tag": "1.27.0",
   "decode_semantics": 1
 }

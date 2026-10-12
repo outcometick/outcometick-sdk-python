@@ -756,11 +756,28 @@ def orders_report(*, policy, stats):
     }
 
 
+def book_age_report(raw):
+    """Keep in sync with bookAgeReport in runner/engine/report.mjs."""
+    if not raw or not raw.get("size_micro", 0) > 0:
+        return None
+    a, b, c, d = raw["by_age_micro"]
+    size = lambda micro: r6(micro / 1e6)  # noqa: E731
+    return {
+        "taker_fills": raw["fills"],
+        "taker_size": size(raw["size_micro"]),
+        "size_by_level_age": {"under_1s": size(a), "1s_to_5s": size(b), "5s_to_30s": size(c), "over_30s": size(d)},
+        "share_over_1s": r6((raw["size_micro"] - a) / raw["size_micro"]),
+        "max_level_age_ms": raw["max_age_ms"],
+        "note": "Taker size by the age of the book level it consumed: fill time minus when that level was last set by a snapshot or delta (archive markets only). The archive drops some deltas, so an older level is more likely to have left the venue already; bbo removes stale levels better than the best price, not deeper ones.",
+    }
+
+
 def build_report(*, run_id, submitted_at, manifest, scope, source_sha256=None, trades, fill_summary,
                  market_summaries, market_meta, fees_paid=0, fill_delay_ms=0, fee_model=None, sweep=None,
                  coverage=None, crosschecks=(), budget=None, seed=None, scanned=None, maker=None, orders=None,
-                 timers=None, fingerprint=None, record=None, spot=None):
+                 timers=None, fingerprint=None, record=None, spot=None, book_age=None):
     closed = [t for t in trades if _finite(t.get("pnl"))]
+    book_age_block = book_age_report(book_age)
     equity = equity_curve(closed)
     matched = sum(1 for c in crosschecks if c.get("match"))
     scope = scope or {}
@@ -806,6 +823,7 @@ def build_report(*, run_id, submitted_at, manifest, scope, source_sha256=None, t
         **({"timers": timers} if timers else {}),
         **({"record": record} if record else {}),
         **({"spot": spot} if spot else {}),
+        **({"book_age": book_age_block} if book_age_block else {}),
         "sweep": sweep,
         "coverage": coverage,
         "budget": budget,

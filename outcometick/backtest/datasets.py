@@ -17,10 +17,22 @@ ALWAYS_FED: tuple = tuple(CONTRACT["always_fed"])
 CAPTURE_WINDOWS: dict = CONTRACT["capture_windows"]
 DERIVED_DATASETS: dict = CONTRACT["derived_datasets"]
 DEGRADING_DATASETS: tuple = tuple(CONTRACT["degrading_datasets"])
+IMPLIED_DATASETS: dict = CONTRACT["implied_datasets"]
 MARKET_INTERVALS: tuple = tuple(CONTRACT["market_intervals"])
 DEFAULT_INTERVALS: tuple = tuple(CONTRACT["default_intervals"])
 
 _SETTLEMENT_STREAMS = ("prices", "twap30s", "twap60s")
+
+
+def with_implied_datasets(datasets) -> list:
+    """The declared datasets plus the ones they imply (book implies bbo), last
+    and in contract order. Keep in sync with normalizeDatasets in
+    api/lib/backtest-datasets.mjs."""
+    out = list(datasets)
+    for ds, by in IMPLIED_DATASETS.items():
+        if by in out and ds not in out:
+            out.append(ds)
+    return out
 
 
 class ManifestError(ValueError):

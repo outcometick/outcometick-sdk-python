@@ -252,6 +252,15 @@ def _add_result(total, r):
         t = total.setdefault("spot", {"markets": 0, "markets_without": 0})
         for k in t:
             t[k] += sp.get(k) or 0
+    # book_age counters: integers, so the sum does not depend on order; absent
+    # when no taker fill took archive depth, like the harness.
+    ba = r.get("book_age")
+    if isinstance(ba, dict):
+        t = total.setdefault("book_age", {"fills": 0, "size_micro": 0, "by_age_micro": [0, 0, 0, 0], "max_age_ms": 0})
+        t["fills"] += ba.get("fills") or 0
+        t["size_micro"] += ba.get("size_micro") or 0
+        t["by_age_micro"] = [x + (y or 0) for x, y in zip(t["by_age_micro"], ba.get("by_age_micro") or [0, 0, 0, 0])]
+        t["max_age_ms"] = max(t["max_age_ms"], ba.get("max_age_ms") or 0)
     # Timer counters (on_timer declared): absent otherwise, like the harness.
     tm = r.get("timers")
     if isinstance(tm, dict):

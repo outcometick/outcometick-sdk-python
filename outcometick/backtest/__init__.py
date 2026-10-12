@@ -37,7 +37,7 @@ import tempfile
 
 from ._contract import CONTRACT
 from .datasets import (
-    ManifestError, engine_policy_for, normalize_feed_latency, normalize_fok, normalize_intervals, normalize_maker_rebate,
+    ManifestError, engine_policy_for, with_implied_datasets, normalize_feed_latency, normalize_fok, normalize_intervals, normalize_maker_rebate,
     normalize_mirror_depth, normalize_order_rules, normalize_queue_model, normalize_quote_guard, normalize_record_ms, resting_policy_for,
 )
 from .decode import BookThrottle, bbo_coverage, build_coverage, count_market_days, count_streams, sort_markets_for_replay
@@ -229,7 +229,7 @@ def run(strategy, data, *, venue=None, assets=None, days=None, datasets=None, in
 
     assets    default BTC, ETH, SOL, XRP (as `ot run`); name others to include them.
     datasets  default: settlement and book (so orders can fill), plus trades
-              when the class has on_trade. Add "bbo" for the top-of-book bound.
+              when the class has on_trade. "bbo" (the top-of-book bound) comes with "book".
     intervals default ["5m"]; Polymarket has 5m and 15m.
     fee_bps   None = each market's venue schedule; a number = flat override.
     cancel_latency_ms  how long ctx.cancel() takes to reach the venue (resting
@@ -454,6 +454,9 @@ def _validate(manifest) -> None:
     for d in manifest["datasets"]:
         if d not in known:
             raise BacktestError("E_MANIFEST", f"unknown dataset {d!r}; known: {', '.join(sorted(known))}")
+    # Declared datasets, deduplicated in order, then the implied ones
+    # (normalizeDatasets in api/lib/backtest-datasets.mjs).
+    manifest["datasets"] = with_implied_datasets(dict.fromkeys(manifest["datasets"]))
     latency = manifest.get("latency")
     if latency is not None and (not isinstance(latency, int) or isinstance(latency, bool)
                                 or not 0 < latency <= CONTRACT["max_latency_ms"]):
@@ -723,6 +726,7 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, wo
             timers=result.get("timers") if policy and policy.get("timers") else None,
             record=rec["block"],
             spot=result.get("spot") if "spot" in (manifest.get("datasets") or []) else None,
+            book_age=result.get("book_age"),
             market_summaries=list(meta.values()),
             market_meta=meta,
             fees_paid=result["fees_paid"],
@@ -958,6 +962,18 @@ def _order_stats(raw, fin):
     return {"rejected": rejected, "rebates": raw["rebates"] if fin(raw.get("rebates")) else 0}
 
 
+def _book_age(raw, fin):
+    """parseBookAge in runner/harness/protocol.mjs."""
+    if not isinstance(raw, dict):
+        return None
+    n = lambda v: v if fin(v) and v >= 0 else 0  # noqa: E731
+    by = raw.get("by_age_micro")
+    if not isinstance(by, list) or len(by) != 4:
+        return None
+    return {"fills": n(raw.get("fills")), "size_micro": n(raw.get("size_micro")), "by_age_micro": [n(v) for v in by],
+            "max_age_ms": n(raw.get("max_age_ms"))}
+
+
 def _parse_result(r: dict) -> dict:
     def fin(x):
         return isinstance(x, (int, float)) and not isinstance(x, bool) and x == x and abs(x) != float("inf")
@@ -974,6 +990,7 @@ def _parse_result(r: dict) -> dict:
                    if isinstance(r.get("timers"), dict) else None),
         "spot": ({k: (r["spot"].get(k) if fin(r["spot"].get(k)) else 0) for k in ("markets", "markets_without")}
                  if isinstance(r.get("spot"), dict) else None),
+        "book_age": _book_age(r.get("book_age"), fin),
         "record": ({"rows": r["record"]["rows"] if fin(r["record"].get("rows")) else 0,
                     "bytes": r["record"]["bytes"] if fin(r["record"].get("bytes")) else 0,
                     "truncated": r["record"].get("truncated") is True}

@@ -1,38 +1,19 @@
-"""Replay markets in parallel, with output identical to a sequential run.
+"""Replay independent markets in parallel with sequential output.
 
-In market mode every market is replayed with a fresh strategy instance and a
-fresh portfolio, so markets are independent and can run on separate cores. What
-is NOT per market, and has to be put back together exactly:
+Merge trades, fills and totals in market order to preserve floating-point sums.
+The log budget is run-wide. Once exhausted, Ctx.log skips message formatting,
+which can have side effects. Record stored lines' byte costs without formatting
+again; replay sequentially if any shard exhausts the budget or the merged costs
+would cause a call after exhaustion.
 
-  - rows: trades and fills are emitted per market, in market order — the shards
-    are merged in that order;
-  - totals: fees_paid, events_seen, the maker counters are sums over markets in
-    market order — summed the same way here, so the floats agree to the bit;
-  - the log budget: ONE allowance for the whole run, spent in market order.
-    Once it is spent, Ctx.log returns WITHOUT formatting the message — so a
-    message whose __str__ has side effects behaves differently from then on,
-    and no merge can undo that. So the parallel result is only used when the
-    budget was never spent: each shard records the exact byte cost of every
-    line it keeps (read off the line Ctx.log stored, never by formatting the
-    message again), the parent adds them up in market order, and the moment
-    the sequential run would have had a call with the allowance gone — or a
-    shard ran out on its own — the whole run is replayed sequentially.
+Parallel replay is opt-in and requires instance-local strategy state. Changed
+or uncheckable class attributes (including nested classes) or params trigger
+sequential replay. Module globals and function attributes remain the caller's
+responsibility. The wall-clock event budget is checked per market here rather
+than across the run.
 
-Not per market, and NOT reproducible on separate processes: state a strategy
-keeps outside its instance, which a sequential run carries from market to
-market. Market mode's contract (and the hosted runner's sharding) rules that
-out, and this path is only taken when the caller asks for parallel replay. As a
-safety net each shard checks the strategy class, the classes defined inside it
-and params, and the parent replays the whole run sequentially if any changed or
-cannot be checked; state elsewhere (module globals, function attributes) is the
-caller's contract to keep.
-
-The per-event budget is the one thing that is not reproduced: it is a wall-clock
-measurement, checked here per market rather than over the whole run.
-
-Session mode shares one instance and one portfolio across markets and is never
-parallelised. Neither is a platform without `fork` (a strategy defined in a
-notebook cell cannot be pickled to a spawned process).
+Session mode shares state and is sequential. Platforms without fork also run
+sequentially, since notebook-defined strategies cannot be pickled for spawn.
 """
 
 from __future__ import annotations
@@ -57,7 +38,7 @@ LOG_NOTICE = ("[runner] log budget spent -- the rest of this run's ctx.log outpu
 
 
 class SharedState(Exception):
-    """The parallel result cannot be the sequential one — the strategy's class or
+    """The parallel result cannot be the sequential one; the strategy's class or
     params changed under a shard, or the run-wide log budget ran out: replay
     sequentially."""
 
@@ -74,11 +55,10 @@ def default_workers() -> int:
 
 
 def _fingerprint(klass, params):
-    """What a sequential run would carry from one market to the next outside
-    the instance: the class's (and its bases') data attributes, and params.
+    """Fingerprint class and base-class data attributes and params.
 
-    None when any of it cannot be pickled: a change inside such an object
-    cannot be seen, so the run must not be split.
+    Return None if any value cannot be pickled, since changes to such state
+    cannot be detected reliably.
     """
     parts = []
     classes = [c for c in getattr(klass, "__mro__", ()) if c is not object]
@@ -258,7 +238,7 @@ def _add_result(total, r):
             t["rejected"][k] = t["rejected"].get(k, 0) + (v or 0)
         t["rebates"] += o.get("rebates") or 0
     # The recorder's budgets: summed in market order, and over either budget the
-    # sequential run would have stopped recording -- so this one says so too.
+    # sequential run would have stopped recording; so this one says so too.
     rc = r.get("record")
     if isinstance(rc, dict):
         t = total.setdefault("record", {"rows": 0, "bytes": 0, "truncated": False})

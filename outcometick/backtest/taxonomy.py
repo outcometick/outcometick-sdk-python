@@ -1,10 +1,7 @@
-"""Archive path -> venue / dataset / asset / interval.
+"""Classify archive paths by venue, dataset, asset and interval.
 
-A port of `classifyPath` in api/lib/data-taxonomy.mjs and `venueOfPath` in
-api/lib/venue-path.mjs. The backtest decides which files to read and which
-stream a row belongs to from this, so it must answer exactly as the JS does;
-client/backtest/equivalence.test.mjs feeds both every path in the public
-samples and compares.
+Keep in sync with classifyPath in api/lib/data-taxonomy.mjs and venueOfPath in
+api/lib/venue-path.mjs. Equivalence tests compare public-sample paths.
 """
 
 from __future__ import annotations

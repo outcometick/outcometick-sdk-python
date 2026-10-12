@@ -1,12 +1,8 @@
-"""JavaScript value semantics the decoder depends on.
+"""JavaScript value semantics used by the decoder.
 
-The archive is decoded by runner/events.mjs for the hosted queue and `ot run`,
-and by this package for a pure-Python run. The two must turn the same row into
-the same event, so wherever the JS leans on a language rule -- `Number(" 12 ")`
-is 12, `Number("")` is 0, `(0.125).toFixed(2)` is "0.13", `String(1.0)` is "1",
-JSON numbers are doubles -- the rule is reproduced here rather than
-approximated with Python's nearest equivalent, which differs in each of those
-cases.
+Keep conversions in sync with runner/events.mjs: Number(" 12 ") is 12,
+Number("") is 0, (0.125).toFixed(2) is "0.13", String(1.0) is "1", and JSON
+numbers are doubles. Python conversions differ for these cases.
 """
 
 from __future__ import annotations
@@ -77,17 +73,15 @@ def js_number(v) -> float:
     return math.nan
 
 
-# The shape nearly every archived number has: a plain decimal with no
-# whitespace, sign other than minus, exponent or radix prefix. For these,
-# JavaScript's Number(s) is exactly float(s), so the general path below — trim,
-# radix check, the full grammar — is skipped. Anything else takes that path.
+# Fast path for plain decimals: float(s) matches JavaScript Number(s).
+# Other spellings use trimming, radix checks and the full grammar below.
 _PLAIN_DECIMAL = re.compile(r"-?[0-9]+(?:\.[0-9]+)?", re.ASCII)
 
 
 def num(v):
     """`num` in runner/events.mjs: a finite number, or None.
 
-    An empty or blank string is None, not 0 -- the reason this exists.
+    Empty and blank strings return None rather than 0.
     """
     t = type(v)
     if t is str and _PLAIN_DECIMAL.fullmatch(v):
@@ -181,7 +175,7 @@ def js_to_fixed(x: float, digits: int) -> str:
 
 
 def js_round_fixed(x, digits: int):
-    """`Number(x.toFixed(digits))` when finite, else None -- report.mjs r2/r4."""
+    """`Number(x.toFixed(digits))` when finite, else None; report.mjs r2/r4."""
     if not isinstance(x, (int, float)) or isinstance(x, bool) or not math.isfinite(x):
         return None
     return float(js_to_fixed(float(x), digits)) + 0.0
@@ -219,5 +213,5 @@ def json_loads(text: str):
 
 
 def split_lines(text: str):
-    """Node readline with crlfDelay: Infinity -- \\n, \\r\\n and a lone \\r end a line."""
+    """Node readline with crlfDelay: Infinity; \\n, \\r\\n and a lone \\r end a line."""
     return re.split(r"\r\n|\r|\n", text)

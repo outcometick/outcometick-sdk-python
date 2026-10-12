@@ -1,11 +1,7 @@
-"""Archived rows -> replayable events.
+"""Decode archived rows into replay events.
 
-A port of runner/events.mjs (the decode half). The hosted queue and `ot run`
-decode the archive with that module; this is the same decoder for a run that
-has no Node. Every rule below is the JS rule, in the JS order, and the reasons
-for each are written down there -- read events.mjs before changing anything
-here, and change both or neither. client/backtest/equivalence.test.mjs decodes
-the public samples with both and compares every event.
+Keep rules and ordering in sync with runner/events.mjs.
+client/backtest/equivalence.test.mjs compares decoded public-sample events.
 """
 
 from __future__ import annotations
@@ -124,7 +120,7 @@ def _polymarket_record(row):
         "open_ts_ms": None if start is None else start * 1000,
         "close_ts_ms": None if end is None else end * 1000,
         "stream": resolve_settlement_stream(row),
-        # None (not []) marks an unusable [Up, Down] pair — market_unusable drops
+        # None (not []) marks an unusable [Up, Down] pair; market_unusable drops
         # it; Predict records keep []. Same rule as runner/events.mjs upDownPair.
         "token_ids": _up_down_pair(token_ids),
         "fee": _fee_of(row),
@@ -318,7 +314,7 @@ def events_from_row(file_path, row, markets, by_slug=None, throttle=None, meta=N
                 "server_ts_ms": server_ms,
                 "recv_ts_ms": recv_ms,
             }))
-        # spot, when declared -- eventsFromRow in runner/events.mjs.
+        # spot, when declared; eventsFromRow in runner/events.mjs.
         if spot and ds == "prices" and meta["venue"] == "polymarket" and meta["asset"]:
             for mid, m in markets.items():
                 if not m["asset"] or js_string(m["asset"]) != js_string(meta["asset"]):

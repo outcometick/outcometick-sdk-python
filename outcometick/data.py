@@ -1,4 +1,4 @@
-"""The data-subscription client: ``outcometick.data``.
+"""Data API client: ``outcometick.data``.
 
     from outcometick.data import DataClient
 
@@ -6,19 +6,9 @@
     res = ot.files(asset=["btc", "eth"], dataset="prices")
     ot.download(res["files"][0], save_to="btc.csv.gz")   # verifies the checksum
 
-Deliberately a SUBMODULE, not part of ``outcometick`` itself. The top level
-exports the strategy SDK -- ``Strategy`` and ``Order`` -- which is what a
-backtest imports, and that code runs in a container with no network at all.
-Keeping the HTTP client one import away means a strategy cannot reach it by
-accident, and the submission analyser rejects the import outright.
-
-Uses only the standard library. A strategy SDK that drags in ``requests`` costs
-every user a dependency for something ``urllib`` already does.
-
-The shapes here were read off api/subscription-api.mjs rather than the docs
-page: the published curl example shows only ``asset`` and ``dataset``, while
-/v1/files also takes a date range, a venue and an interval, and every filter
-accepts comma-separated alternatives plus a ``none`` sentinel.
+Separate from the strategy SDK: the sandbox has no network and rejects this
+import. Uses the standard library. The API contract is defined in
+api/subscription-api.mjs.
 """
 
 from __future__ import annotations
@@ -41,12 +31,8 @@ NO_VALUE = "none"
 
 
 class OutcometickError(Exception):
-    """An API error, carrying whatever the server said alongside the status.
-
-    A 403 on a date outside coverage also reports the real ``floor`` and
-    ``ceiling``. That is the difference between "you cannot have this" and "you
-    cannot have this, here is what you can have", so the body is kept rather
-    than flattened into a message.
+    """API error with status, response body and URL. Out-of-coverage 403
+    responses include ``floor`` and ``ceiling`` in the body.
     """
 
     def __init__(self, status: int, body, url: str) -> None:
@@ -59,11 +45,7 @@ class OutcometickError(Exception):
 
 
 def _filter_value(value):
-    """Render one filter.
-
-    A list joins with commas because that is exactly what the API means by
-    ``asset=btc,eth`` -- alternatives, not a nested structure. Passing a list is
-    the friendlier spelling of the same request, so both work.
+    """Render a string or list as comma-separated filter alternatives.
     """
     if value is None:
         return None
@@ -76,8 +58,7 @@ class DataClient:
     """Client for the outcometick data subscription API."""
 
     def __init__(self, key=None, base_url=DEFAULT_BASE_URL, timeout=60, opener=None):
-        # Read at construction so "you have not set a key" is raised once and
-        # early, rather than as a 401 from whichever call happened to be first.
+        # Capture the key at construction; authenticated requests check it before sending.
         self.key = key if key is not None else os.environ.get("OT_KEY")
         self.base_url = str(base_url).rstrip("/")
         self.timeout = timeout
@@ -138,12 +119,10 @@ class DataClient:
     # -- discovery --------------------------------------------------------
 
     def meta(self):
-        """The date window this key can see, and every dimension value in it.
+        """Return the accessible date window and its dimension values.
 
-        ``assets`` and ``intervals`` hold real symbols and real durations only.
-        The ``none`` sentinel is reported separately under ``filterTokens``,
-        because a caller that builds an enum from ``intervals`` or parses them
-        as durations must not meet a token.
+        ``assets`` contains symbols and ``intervals`` contains durations. The ``none``
+        sentinel is separate, under ``filterTokens``.
         """
         return self._json("/v1/meta")
 
@@ -155,13 +134,13 @@ class DataClient:
               asset=None, interval=None, format=None):
         """Search for files across a date range.
 
-        :param date:     one day -- sugar for ``from_ == to``. Not combinable
+        :param date:     one day; sugar for ``from_ == to``. Not combinable
                          with ``from_``/``to``.
         :param from_:    inclusive start; defaults to the newest day in scope.
         :param to:       inclusive end; defaults to ``from_``.
         :param venue:    ``polymarket`` | ``predict-fun``
         :param dataset:  ``prices`` | ``twap60s`` | ``book`` | ... (see meta())
-        :param asset:    the BASE symbol -- ``BTC``, ``ETH``, ``SOL``, ... NOT
+        :param asset:    the base symbol; ``BTC``, ``ETH``, ``SOL``, ... rather than
                          the pair. Files are named ``BTCUSD-...`` but the
                          dimension is ``BTC``; ``"BTCUSD"`` matches nothing.
                          ``meta()["assets"]`` lists the real values.
@@ -169,16 +148,14 @@ class DataClient:
                          that have no period
 
         Every filter takes a string or a list; a list means "any of these".
-        ``interval=["5m", NO_VALUE]`` is how you ask for 5-minute files AND the
-        period-less settlement streams -- asking for ``"5m"`` alone
-        deliberately excludes them.
+        ``interval=["5m", NO_VALUE]`` is how you ask for 5-minute files and the
+        period-less settlement streams; asking for ``"5m"`` alone
+        excludes them.
 
         The server caps the range (92 days by default) and answers 400 past it.
         """
         if date and (from_ or to):
-            # The server rejects this too; catching it here saves a round trip
-            # and says the same thing, so the two cannot describe it
-            # differently.
+            # Reject conflicting date filters before sending the request.
             raise ValueError("use either date, or from_/to -- not both")
         return self._json("/v1/files", {
             "date": date, "from": from_, "to": to,
@@ -192,8 +169,7 @@ class DataClient:
     def sign_url(self, date, name, expires_in=None):
         """A presigned URL for one file, without fetching it.
 
-        Useful when something else does the fetching -- pandas, a job runner, a
-        browser. The URL is short-lived; hold the ``(date, name)`` pair and ask
+        For fetching through pandas, a job runner or a browser. The URL is short-lived; hold the ``(date, name)`` pair and ask
         again rather than storing it.
         """
         query = {"date": date, "name": name}
@@ -202,16 +178,11 @@ class DataClient:
         return self._json("/v1/mirror/download", query)
 
     def download(self, file_or_date, name=None, verify=True, save_to=None):
-        """Download one file.
+        """Download one file, given a :meth:`files` row or explicit date and name.
 
-        Accepts either a row from :meth:`files` or an explicit date and name.
-
-        The checksum is verified by default. /v1/dl answers 302 with the sha256
-        in a header and the bytes come from R2 behind the redirect, so the
-        redirect is followed MANUALLY: letting urllib follow it would discard
-        the header, and with it the only checksum available without a second
-        API call. A row from :meth:`files` carries its own sha256, which is
-        used when present.
+        Verify the checksum by default. Follow the /v1/dl redirect manually to retain
+        its sha256 header before fetching bytes from R2. Prefer the :meth:`files` row
+        checksum when present.
         """
         if isinstance(file_or_date, dict):
             row = file_or_date
@@ -267,10 +238,9 @@ class DataClient:
 
     # -- smart money --------------------------------------------------------
     #
-    # A separate subscription with its OWN key (a data key gets 403 here, and a
-    # smart-money key gets 403 on everything above). Daily files of the trades
-    # made by the top-ranked Polymarket traders: list ``top100``, or
-    # ``top1000`` on the Top 1000 plan. While it is not on sale these answer 503.
+    # Smart-money endpoints require a separate key: data keys receive 403 here
+    # and smart-money keys receive 403 on data endpoints. Daily lists are top100
+    # or top1000 (Top 1000 access). Endpoints return 503 when unavailable for sale.
 
     def smart_days(self):
         """The days this smart-money key may download, newest first, with each list's status."""
@@ -281,7 +251,7 @@ class DataClient:
 
         Verified against the sha256 the server sends with the redirect.
 
-        :param day:   ``YYYY-MM-DD`` -- take it from :meth:`smart_days`
+        :param day:   ``YYYY-MM-DD``; take it from :meth:`smart_days`
         :param list_: ``top100`` | ``top1000``
         """
         if not day:
@@ -296,7 +266,7 @@ class DataClient:
     # -- public, no key needed --------------------------------------------
 
     def coverage(self):
-        """Coverage across all venues. Public -- works without a key."""
+        """Coverage across all venues. Public; works without a key."""
         return self._json("/v1/public/coverage", auth=False)
 
     def plans(self):
@@ -335,7 +305,7 @@ _NUMERIC = re.compile(r"[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?", re.ASCII)
 
 def _num(x):
     """A finite float, or NaN. Only a finite number or a plain decimal string
-    ("0.5", "12", "1e-1") counts -- float() alone would take " 1 ", "1_0" and
+    ("0.5", "12", "1e-1") counts; float() alone would take " 1 ", "1_0" and
     "inf". Same rule as the JS client."""
     if isinstance(x, bool):
         return float("nan")
@@ -389,14 +359,11 @@ class OrderBook:
       the best prices come from ``best_bid_ask`` and from the ``best_bid`` /
       ``best_ask`` each ``price_change`` item carries.
 
-    Why the last step: book and price_change are captured at a cadence, so a
-    removal can fall between two stored frames and leave its level behind until
-    the next snapshot. Pruning against the newest best prices removes every
-    level they have moved past. It cannot restore what dropped frames added or
-    resized: until the next snapshot a level -- at the top too -- can be missing
-    or carry an old size, because best_bid_ask carries prices only. ``best()`` is
-    the best level of the rebuilt ladder, not the market's latest best bid and
-    ask; read best_bid_ask rows for those.
+    Captured book and price_change rows may omit removals between frames.
+    Pruning removes levels crossed by newer best prices, but cannot recover
+    missing additions or size changes. Until the next snapshot, any level,
+    including the top, may be missing or stale. best() returns the rebuilt
+    ladder's best levels; read best_bid_ask for the latest market best prices.
 
     Prices and sizes are returned as the archive wrote them (strings). Rows of
     other types are ignored. Predict.fun order-book rows are full snapshots on

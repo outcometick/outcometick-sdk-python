@@ -1,9 +1,7 @@
-"""Reading an unpacked archive off disk, one day at a time.
+"""Read an unpacked archive one day at a time.
 
-A port of cli/local-data.mjs (what `ot run` reads) and runner/spool-day.mjs
-(how a day is split into one event file per market). Same file selection, same
-read order, same per-market spool, so a pure-Python run replays the identical
-events a queued run does.
+Keep file selection and ordering in sync with cli/local-data.mjs, and per-market
+event spooling in sync with runner/spool-day.mjs.
 """
 
 from __future__ import annotations
@@ -34,21 +32,15 @@ _SPOOL_FLUSH_ROWS = 512
 
 
 def walk(root: str, prefix: str = "", depth: int = 0) -> list:
-    """Every regular file under root, archive-relative, in directory order.
-
-    Symlinks are skipped in both directions, like the JS: an archive is
-    something downloaded from the internet, and a link inside it could name any
-    file on the machine.
+    """Return archive-relative paths for regular files in directory order.
+    Skip symlinked files and directories to keep reads inside the archive.
     """
     out: list = []
     if depth > 12:
         return out
     try:
-        # SORTED BY BYTES, as Node's fs.readdir returns them (libuv sorts
-        # scandir results with strcmp). os.scandir is raw filesystem order, and
-        # the order files are found in decides the order of a day's markets and
-        # of the dropped-market list in the report: equal on one filesystem,
-        # different on another (CI caught it on ext4 vs the author's machine).
+        # Match Node fs.readdir's byte ordering (libuv strcmp) so market and
+        # dropped-market order is stable across filesystems.
         entries = sorted(os.scandir(os.path.join(root, prefix) if prefix else root),
                          key=lambda e: os.fsencode(e.name))
     except OSError:
@@ -77,7 +69,7 @@ def read_rows(root: str, rel: str):
     full = os.path.join(root, rel)
     opener = gzip.open if rel.endswith(".gz") else open
     is_csv = ".csv" in rel
-    # Universal newlines end a line at \n, \r\n or a lone \r -- the same three
+    # Universal newlines end a line at \n, \r\n or a lone \r; the same three
     # Node's readline (crlfDelay: Infinity) splits on. Streamed: a day of
     # best_bid_ask decompresses to gigabytes.
     with opener(full, "rb") as raw, io.TextIOWrapper(raw, encoding="utf-8", errors="replace", newline=None) as fh:
@@ -119,13 +111,10 @@ def looks_like_archive(root: str) -> bool:
 # --- JSON round trip ------------------------------------------------------
 
 def jsonify(v):
-    """The value a JSON.stringify -> JSON.parse round trip leaves behind.
+    """Match a JSON.stringify/JSON.parse round trip.
 
-    The queue hands every event and market header to the harness as JSON, so an
-    integral double arrives in Python as an int and -0 arrives as 0. A
-    pure-Python run hands them over in-process; without this, a timestamp would
-    reach the strategy as 1788796800000.0 instead of 1788796800000 and every
-    `ctx.log` line that prints one would differ.
+    The hosted harness receives integral doubles as ints and negative zero as
+    zero. Apply the same conversion in-process so values and log text agree.
     """
     t = type(v)
     if t is float:
@@ -135,10 +124,7 @@ def jsonify(v):
             return int(v)
         return v
     if t is dict:
-        # Strings, ints, bools and None come back as they went in, and a float
-        # is converted inline, so neither costs a call — most of an event's
-        # values, and most of the decode time this used to cost. The float rule
-        # is the one above, spelled out.
+        # Handle common scalar types inline; floats follow the round-trip rule.
         return {k: x if type(x) in _AS_IS else (
             (0 if x == 0 else int(x) if x.is_integer() and -1e21 < x < 1e21 else x)
             if type(x) is float else jsonify(x)) for k, x in v.items()}
@@ -289,26 +275,13 @@ def _finish_market(market_id, market, events, raw, *, day, events_dir, book_fact
     }
 
 
-# --- the same spool, on several processes ----------------------------------
-#
-# Two phases, both deterministic, and the output is the sequential spool's,
-# byte for byte (client/backtest/tests: Parallel; equivalence.test.mjs).
-#
-#  1. STRIPES. Worker k reads every file of the day but parses only the
-#     non-blank data lines whose index is k mod N (decompressing is cheap; the
-#     JSON parse and the event building are what cost). Each event is written,
-#     tagged with (file index, line index, position in the row) and its market,
-#     to one of B bucket files by market. The book throttle is STATEFUL per
-#     market and order-dependent, so it is not applied here: every row that
-#     consults it leaves a marker (j = -1) with the timestamp it was consulted
-#     with — even a row that then yields no event, because consulting it still
-#     moves the throttle.
-#  2. BUCKETS. Each bucket's markets are rebuilt from all stripes in exactly
-#     the sequential order (file, line, position), the throttle is replayed on
-#     the markers from the state the run's throttle already had, and each market
-#     is finished by the same _finish_market the sequential spool uses. The
-#     throttle state of the bucket's markets goes back to the parent, so the
-#     next day starts where a sequential run would.
+# Parallel spool with sequential output.
+# 1. Worker k parses nonblank rows at index k mod N and writes tagged events
+#    into market buckets. Save every throttle call as a j=-1 marker, including
+#    calls that yield no event, since they still update its state.
+# 2. Rebuild markets in (file, line, row position) order and replay markers from
+#    the initial throttle state. Use _finish_market and return updated throttle
+#    state to the parent for the next day.
 
 _PSTATE: dict = {}
 # The children read _PSTATE as it was at fork time, and the pool forks lazily,
@@ -556,24 +529,10 @@ def load_local_day(*, root, day, venue, assets, datasets, intervals, throttle, e
 
 # --- decoded-day cache ----------------------------------------------------
 #
-# Decoding a day is the slow part of a local run (minutes for a busy day in
-# pure Python) and the part that does not change while a strategy is being
-# iterated on. So a decoded day is kept under the user's cache directory and
-# reused, keyed on everything that changes what decoding produces:
-#
-#   - the decoder itself: a hash of this package's decoding source files and of
-#     the engine file whose Book prices the opening quotes. Any edit to them is
-#     a different key, so a stale entry can never be read back;
-#   - the run shape: venue, day, assets, datasets, intervals, and the book
-#     cadence chosen for the RANGE (it changes with the range, see BookThrottle);
-#   - the day's files: every archive file dated that day, by path and by the
-#     SHA-256 of its bytes. Not size and modification time: two archives with
-#     equal metadata and different contents (or a file replaced in place with its
-#     timestamp kept) would otherwise share an entry. Hashing a day is under a
-#     second against minutes of decoding.
-#
-# An entry is written to a temporary directory and renamed into place, so a run
-# interrupted half way leaves nothing that could be mistaken for a decoded day.
+# Cache decoded days by decoder and Book source hashes, run dimensions,
+# range-wide book cadence, and each dated archive file path and SHA-256.
+# Content hashes distinguish files with equal size and modification time.
+# Publish entries by directory rename so interrupted writes stay invisible.
 
 import hashlib as _hashlib
 import shutil as _shutil

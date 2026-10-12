@@ -1,11 +1,8 @@
-"""Hand-computed answers for outcometick.backtest.
+"""Hand-computed backtest expectations, complementing engine equivalence tests.
 
-client/backtest/equivalence.test.mjs proves this package agrees with the queue
-and `ot run`. Agreement alone would pass two implementations that are wrong the
-same way, so these cases are worked out by hand from the published rules:
-fills walk the resting depth, the venue's taker fee is C x rate x p x (1 - p)
-rounded to 5 decimals per level taken, a market settles at $1 / $0 off its own
-settlement stream, and a hook never sees what happens later.
+Fills walk resting depth. Taker fees are C x rate x p x (1 - p), rounded to
+five decimals per level. Settlement uses the market's own stream and pays
+$1/$0 (or $0.50 on a tie). Hooks see only events already replayed.
 """
 
 from __future__ import annotations
@@ -61,7 +58,7 @@ def build_archive(root, *, outcome="UP", fee=True, asks=((0.50, 60), (0.52, 40))
     _write(root, f"data/polymarket/daily/book/BTC-5m/BTC-5m-book-{day}.jsonl.gz", [
         book(T0 + 1000, UP_TOKEN, asks, [(0.48, 100)]),
         book(T0 + 1000, DOWN_TOKEN, [(0.53, 100)], [(0.47, 100)]),
-        # A later, much dearer book: only a strategy that waited could pay this.
+        # The later book is more expensive, so it distinguishes delayed entry.
         book(T0 + 200_000, UP_TOKEN, [(0.90, 500)], [(0.88, 500)]),
     ], gz=gz)
     _write(root, f"data/chainlink-twap-60s/daily/prices/BTCUSD/BTCUSD-twap60s-prices-{day}.csv.gz",
@@ -495,8 +492,8 @@ def build_multi_archive(root, markets=6, day="2026-09-08", t0=T0):
 
 
 class Chatty(Strategy):
-    """Logs every tick — with trailing whitespace, which the harness strips from
-    what it prints but still charges to the log budget — and trades once a market."""
+    """Log each tick and trade once per market. Trailing whitespace is stripped
+    from output but still counts toward the log budget."""
 
     def on_market_open(self, ctx, market):
         self.done = False
@@ -510,8 +507,7 @@ class Chatty(Strategy):
 
 
 class Parallel(unittest.TestCase):
-    """workers > 1 replays markets on separate processes; the result must be the
-    sequential one, byte for byte — rows, totals and the run-wide log budget."""
+    """Parallel replay must match sequential rows, totals and log budgeting."""
 
     def setUp(self):
         self.root = build_multi_archive(tempfile.mkdtemp(prefix="ot-bt-par-"))
@@ -624,8 +620,7 @@ class PidSide(SizedSide):
 
 
 class CountsCells(SizedSide):
-    """Counts its runs on the CLASS and sizes by the count: a sequential sweep
-    carries the count from cell to cell, so a parallel one has to as well."""
+    """Size by a class-level run count, which sequential sweeps carry across cells."""
     calls = 0
 
     def on_market_open(self, ctx, market):
@@ -657,7 +652,7 @@ class HangsOn99(FailsOn13):
 
 
 class DiesOn77(SizedSide):
-    """On a forked cell with size 77: start a sleeper, then die without a word."""
+    """Start a sleeper in the forked size-77 cell, then exit without a result."""
 
     def on_tick(self, ctx, tick):
         if ctx.p.size == 77 and os.getpid() != ctx.p.parent:
@@ -905,8 +900,8 @@ class Sweeps(unittest.TestCase):
 
 
 class CountsMarkets(Strategy):
-    """Keeps a counter on the CLASS — outside the market-mode contract, but a
-    sequential run carries it across markets, so a parallel one must too."""
+    """Class counters persist in sequential replay, so parallel replay must match.
+    Class state is outside the market-mode contract."""
     seen = 0
 
     def on_market_open(self, ctx, market):
@@ -921,7 +916,7 @@ class CountsMarkets(Strategy):
 
 
 class Once:
-    """A log message that may be formatted exactly once, as Ctx.log formats it."""
+    """Raise if Ctx.log formats the message more than once."""
 
     def __init__(self, n):
         self.n = n
@@ -988,16 +983,14 @@ class ParallelContract(unittest.TestCase):
         before = _ENGINE["otreplay"].Ctx.log
         seq = run(LogsObjects, self.root, assets=["BTC"], workers=1, cache=False)
         par = run(LogsObjects, self.root, assets=["BTC"], workers=4, cache=False)
-        # The cost of a line is read off the line Ctx.log stored: a second
-        # str(msg) would raise in Once and fail the run.
+        # Read stored-line cost without calling str(msg) a second time.
         self.assertIs(_ENGINE["otreplay"].Ctx.log, before)
         self.assertIn("once#1", seq.logs)
         self.same(seq, par)
 
 
 class Flag:
-    """Formatting this message flips the strategy's own side — a side effect
-    Ctx.log stops having once the run's log budget is spent."""
+    """Formatting flips the strategy side; exhausted log budgets skip formatting."""
 
     def __init__(self, owner):
         self.owner = owner
@@ -1077,10 +1070,11 @@ class LogsBooks(Strategy):
 
 
 class DaysDecodeAlone(unittest.TestCase):
-    """A day decodes the same whatever day was decoded before it, as the hosted
-    runner and `ot run` decode it: the book throttle starts afresh each day. A
-    market across midnight has price changes 8 ms apart on either side of it,
-    inside BTC's 20 ms window -- carried over, the throttle would drop the second."""
+    """Reset throttling each day, matching hosted and CLI decoding.
+
+    Cross-midnight changes 8 ms apart must both survive BTC's 20 ms cadence
+    because they belong to different days.
+    """
 
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="ot-bt-days-")
@@ -1118,7 +1112,7 @@ class DaysDecodeAlone(unittest.TestCase):
         self.assertIn(f"book {T0 + 86_400_000 + 3}", two)
         both = run(LogsBooks, self.root, assets=["BTC"], days=["2026-09-08", "2026-09-09"], cache=False).logs
         self.assertEqual(both, one + "\n" + two)
-        # And the cache holds each day as it decodes alone, whichever run wrote it.
+        # Cached decoding must match decoding each day independently.
         run(LogsBooks, self.root, assets=["BTC"], days=["2026-09-08", "2026-09-09"], cache=self.cache)
         self.assertEqual(run(LogsBooks, self.root, assets=["BTC"], days=["2026-09-09"], cache=self.cache).logs, two)
 
@@ -1141,7 +1135,7 @@ class ParallelEdges(unittest.TestCase):
     def test_a_bad_row_the_throttle_drops_is_dropped_in_parallel_too(self):
         good = {"asset_id": "1" * 70, "side": "BUY", "price": "0.49", "size": "10", "best_bid": "0.49", "best_ask": "0.50"}
         # BTC's throttle on this day is 20 ms: the second row is dropped by it
-        # before its payload is read — sequentially it never fails.
+        # before its payload is read, so sequential decoding does not fail.
         add_price_changes(self.root, [price_change(T0 + 2000, [good]), price_change(T0 + 2005, [good, None]),
                                       price_change(T0 + 3000, [good])])
         seq = run(BuyOnce, self.root, assets=["BTC"], workers=1, cache=False)
@@ -1200,8 +1194,7 @@ class ParallelNested(unittest.TestCase):
 
 
 class ConcurrentRuns(unittest.TestCase):
-    """Two run() calls at once in one process, each decoding in parallel, must
-    not see each other's archive."""
+    """Concurrent runs in one process must keep their decoded archives separate."""
 
     def test_two_threads_decoding_different_archives(self):
         import threading

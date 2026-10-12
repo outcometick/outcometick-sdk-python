@@ -1,9 +1,7 @@
-"""The free public sample archive, fetched once and cached.
+"""Fetch and cache a public sample archive, one real archive day per venue.
 
-One day of real archive per venue, the same files a subscriber downloads, laid
-out exactly as the archive is. Published as GitHub Release assets (not the git
-repository) by outcometick/polymarket-tick-data-samples and
-outcometick/predict.fun-data-samples.
+GitHub Release assets preserve the archive layout:
+outcometick/polymarket-tick-data-samples and outcometick/predict.fun-data-samples.
 """
 
 from __future__ import annotations

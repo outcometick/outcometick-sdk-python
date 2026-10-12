@@ -1,4 +1,4 @@
-"""What a report says about a generic-data run. MUST MATCH runner/generic-report.mjs."""
+"""What a report says about a generic-data run. Keep in sync with runner/generic-report.mjs."""
 
 from __future__ import annotations
 
@@ -76,7 +76,7 @@ def generic_report_extras(*, trades, markets, unusable, counts):
 
 
 def apply_generic_extras(report, extras):
-    """MUST MATCH applyGenericExtras: key order is part of the bytes."""
+    """Keep in sync with applyGenericExtras: key order is part of the bytes."""
     out = {}
     for k, v in report.items():
         if k == "scope":

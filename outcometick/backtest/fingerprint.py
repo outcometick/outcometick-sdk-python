@@ -1,12 +1,10 @@
-"""A run's pre-registration fingerprint -- api/lib/backtest-fingerprint.mjs.
+"""Compute a run's pre-registration SHA-256 fingerprint.
 
-One sha256 over everything that decides what a backtest computes: the
-strategy's code, its manifest (defaults spelled out), the params it ran with,
-the execution options, the data scope and the seed. Compute it before looking at
-results, publish it, then show the report carrying the same value.
+Covers strategy code, manifest with defaults, params, execution options, data
+scope and seed. Publish it before viewing results, then compare with the report.
 
-MUST MATCH backtest-fingerprint.mjs: same canonical JSON (keys sorted, numbers
-as JavaScript prints them), same file walk as `ot`'s readSubmission, same hash.
+Keep in sync with api/lib/backtest-fingerprint.mjs: canonical JSON uses sorted
+keys and JavaScript number formatting; file selection matches readSubmission.
 """
 
 from __future__ import annotations
@@ -74,7 +72,7 @@ def read_submission(path: str) -> list:
 
 
 def code_digest(files):
-    # Every submitted file, outcometick.json included, byte for byte -- see codeDigest.
+    # Every submitted file, outcometick.json included, byte for byte; see codeDigest.
     code = sorted(files or [], key=lambda f: _js_key(f["name"]))
     if not code:
         return None

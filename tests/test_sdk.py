@@ -1,13 +1,4 @@
-"""Tests for the public Python SDK surface.
-
-Small on purpose: this package is the SDK surface and nothing else, so these
-assert the contract a strategy author actually depends on — the names that
-exist, and the argument validation that rejects a bad order at construction
-rather than silently at fill time.
-
-They ship with the published package so the mirror is a repository someone can
-clone and verify rather than take on faith.
-"""
+"""Check public SDK exports and order validation at construction time."""
 
 import unittest
 
@@ -19,8 +10,7 @@ class TestSurface(unittest.TestCase):
         import outcometick
 
         self.assertEqual(sorted(outcometick.__all__), ["Order", "SIDES", "Strategy"])
-        # __all__ also keeps `annotations` from `from __future__ import` out of
-        # the public namespace, which is what a reader sees in dir().
+        # __all__ excludes the future-import name from wildcard imports.
         self.assertNotIn("annotations", outcometick.__all__)
 
     def test_sides_are_the_two_outcome_tokens(self):
@@ -44,8 +34,7 @@ class TestOrder(unittest.TestCase):
                 Order(side=bad, size=100)
 
     def test_accepts_an_outcome_label(self):
-        # Generic data: the runner checks the label against the market, and
-        # stops the run on one the market does not have.
+        # The runner validates labels against the market's outcomes.
         self.assertEqual(Order(side="Yes", size=1).side, "Yes")
 
     def test_rejects_a_non_positive_size(self):
@@ -54,8 +43,7 @@ class TestOrder(unittest.TestCase):
                 Order(side="UP", size=bad)
 
     def test_rejects_a_limit_outside_zero_to_one(self):
-        # A binary outcome token trades between 0 and 1. Anything else is not a
-        # price, and clamping it would fill an order nobody asked for.
+        # Binary token prices are bounded by 0 and 1; reject rather than clamp.
         for bad in (-0.01, 1.5, 100):
             with self.assertRaises(ValueError):
                 Order(side="UP", size=1, limit=bad)
@@ -66,9 +54,7 @@ class TestStrategy(unittest.TestCase):
         self.assertEqual(Strategy().p, {})
 
     def test_hooks_are_not_defined_by_the_base_class(self):
-        # Deliberate: a default no-op on_tick would turn "you declared a hook you
-        # did not implement" — fixable in seconds — into a run that quietly never
-        # trades and bills for an empty equity curve.
+        # Missing declared hooks must be reported, not hidden by base-class no-ops.
         for hook in ("on_tick", "on_market_open", "on_book", "on_trade", "on_settle"):
             self.assertFalse(hasattr(Strategy, hook), hook)
 
@@ -78,16 +64,10 @@ if __name__ == "__main__":
 
 
 class TestStrictNumbers(unittest.TestCase):
-    """The SDK accepts numbers, not things that can be coerced into numbers.
+    """Accept numeric values without coercion.
 
-    The engine was tightened first, and the SDK kept coercing — so
-    ``Order(limit=[0.5])`` raised TypeError in Python while
-    ``new Order({limit:[0.5]})`` quietly became 0.5 in JavaScript. One
-    published SDK, two languages, two behaviours, from the same input.
-
-    `float('0.5')` and `Number('0.5')` agree; `float([0.5])` and
-    `Number([0.5])` do not. Coercion is not validation, and the two languages
-    do not coerce alike.
+    Python and JS differ on coercion: float([0.5]) raises, while
+    Number([0.5]) returns 0.5. Apply the same validation in both SDKs.
     """
 
     def test_a_limit_must_be_a_number(self):
@@ -104,20 +84,20 @@ class TestStrictNumbers(unittest.TestCase):
         for bad in ['80', [80], True, float('inf'), float('nan'), 0, -1]:
             with self.assertRaises(ValueError, msg=f'{bad!r} was accepted as a notional'):
                 Order(side='UP', notional=bad, limit=0.5)
-        # And a budget with no ceiling has no conversion.
+        # Notional sizing requires a price ceiling.
         with self.assertRaises(ValueError):
             Order(side='UP', notional=80)
 
     def test_the_legal_values_still_work(self):
-        # Tightening a check is only correct if it does not refuse the product.
+        # Strict validation must still accept legal numeric values.
         for limit in [0, 0.5, 1]:
             self.assertEqual(Order(side='UP', size=10, limit=limit).limit, float(limit))
         self.assertEqual(Order(side='UP', size=2.5).size, 2.5)
-        # floor(80 / 0.64) is 125 — the boundary where Python's `//` disagrees.
+        # floor(80 / 0.64) is 125; Python floor division gives 124.
         self.assertEqual(Order(side='UP', notional=80, limit=0.64).size, 125)
 
     def test_a_resting_order_needs_a_limit_and_takes_its_own_fields(self):
-        # Mirrors sdk-order.test.mjs: a gtc order rests AT a price.
+        # Keep in sync with sdk-order.test.mjs: gtc requires a resting price.
         o = Order(side='UP', size=10, limit=0.4, tif='gtc', post_only=True, client_id='q-1')
         self.assertEqual((o.tif, o.post_only, o.client_id), ('gtc', True, 'q-1'))
         self.assertEqual((Order(side='UP', size=10).post_only, Order(side='UP', size=10).client_id), (False, None))

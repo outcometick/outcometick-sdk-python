@@ -1,14 +1,8 @@
-"""The backtest report.
+"""Build reports and validate harness rows.
 
-A port of runner/engine/report.mjs and of the row validation in
-runner/harness/protocol.mjs (parseTrade / parseFill / parseResult). The hosted
-queue and `ot run` build the report with the JS; a pure-Python run builds it
-with this, and client/backtest/equivalence.test.mjs requires the two reports to
-be equal over the same archive. The reasons behind each number are written in
-report.mjs -- read them there before changing anything here.
-
-Float arithmetic is done in the JS order (left-to-right sums, the same sorts)
-so the results agree to the bit, and rounding uses JS `toFixed` semantics.
+Keep in sync with runner/engine/report.mjs and runner/harness/protocol.mjs.
+Preserve JavaScript arithmetic order, sorting and toFixed rounding for identical
+results. client/backtest/equivalence.test.mjs compares public-sample reports.
 """
 
 from __future__ import annotations
@@ -544,7 +538,7 @@ def record_report(*, samples, record_ms, harness, max_rows=math.inf):
             "max_position_value": r2(max_pos),
             "mean_position_value": r2(sum_pos / len(pts)) if pts else None,
         },
-        # Rounded where they are written out -- see recordReport.
+        # Rounded where they are written out; see recordReport.
         "points": [{**p, "value": r6(p["value"]), "position_value": r6(p["position_value"])} for p in pts],
         "samples": [{**x, "cash": r6(x["cash"]), "marked": r6(x["marked"]), "position_value": r6(x["position_value"])}
                     for x in samples],
@@ -726,7 +720,7 @@ def fee_model_report(*, policy, markets):
 
 
 def orders_report(*, policy, stats):
-    """MUST MATCH ordersReport in runner/engine/report.mjs."""
+    """Keep in sync with ordersReport in runner/engine/report.mjs."""
     if not policy or (not policy.get("fok") and not policy.get("order_rules") and policy.get("maker_rebate") is None
                       and not policy.get("quote_guard") and not policy.get("mirror_depth")):
         return None
@@ -868,7 +862,7 @@ def _num_or_none(v):
 
 
 def _generic_trade_fields(raw):
-    """A generic market's extra trade fields. MUST MATCH genericTradeFields in protocol.mjs."""
+    """A generic market's extra trade fields. Keep in sync with genericTradeFields in protocol.mjs."""
     mp = raw.get("mark_px")
     return {
         "label": _js_slice(raw["label"], 200),
@@ -941,7 +935,7 @@ def parse_fill(raw):
     }
 
 
-# MUST MATCH REJECT_REASONS in runner/harness/protocol.mjs.
+# Keep in sync with REJECT_REASONS in runner/harness/protocol.mjs.
 REJECT_REASONS = ("fok_unfilled", "quote_guard", "below_min_size", "size_step", "off_tick")
 
 

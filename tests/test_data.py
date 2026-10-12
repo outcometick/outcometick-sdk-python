@@ -1,13 +1,7 @@
-"""Tests for the Python data-subscription client.
+"""Python data-client tests against a subscription API stub.
 
-Driven against a stub whose behaviour was copied from
-api/subscription-api.mjs -- the 302-with-checksum on /v1/dl, the
-date-XOR-from/to rejection, the 403 that carries floor and ceiling. The point is
-not that the client works against a friendly server; it is that it handles what
-the real routes actually do.
-
-Mirrors client/data.test.mjs case for case, for the same reason the two engines
-have a conformance suite: two clients that drift are worse than one.
+Cover checksum-bearing redirects, exclusive date/range parameters and 403
+window bounds. Keep cases in sync with client/data.test.mjs.
 """
 
 from __future__ import annotations
@@ -112,7 +106,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return None
         if u.path.startswith("/v1/dl/"):
-            # Exactly what the real route does.
+            # Match the API's download redirect.
             self.send_response(302)
             self.send_header("location", f"http://127.0.0.1:{self.server.server_port}/signed-bytes")
             self.send_header("x-outcometick-sha256", SHA)
@@ -243,7 +237,7 @@ class TestDownload(ClientTestCase):
         got = self.ot.download(res["files"][0])
         self.assertEqual(got["bytes"], PAYLOAD)
         self.assertEqual(got["sha256"], SHA)
-        # The signed URL was fetched WITHOUT our key.
+        # Do not forward the API key to the signed URL.
         signed = [s for s in SEEN if s["path"] == "/signed-bytes"]
         self.assertEqual(signed[0]["auth"], None)
 

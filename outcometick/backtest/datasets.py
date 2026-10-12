@@ -1,10 +1,7 @@
-"""What a run reads from the archive.
+"""Select archive files, settlement streams and read order for a run.
 
-A port of the parts of api/lib/backtest-datasets.mjs a local run needs:
-which archive datasets a manifest's datasets expand to, which files belong to
-a run, which settlement files the day's markets need, and the order files are
-read in. The order matters: events stamped the same millisecond fall back to
-read order, so a different order is a different report.
+Keep in sync with api/lib/backtest-datasets.mjs. Equal-timestamp events use
+read order as a tie-breaker, so file ordering affects results.
 """
 
 from __future__ import annotations
@@ -156,7 +153,7 @@ def file_matches_run(file_path: str, *, venue: str, assets, archive_datasets, in
 
 
 def resting_policy_for(manifest, venue) -> dict:
-    """restingPolicyFor in api/lib/backtest-datasets.mjs, word for word."""
+    """restingPolicyFor in api/lib/backtest-datasets.mjs, with matching behavior."""
     def refuse(refusal):
         return {"allowed": False, "refusal": refusal, "cancelLatencyMs": 0}
     if venue != "polymarket":
@@ -190,10 +187,8 @@ def normalize_intervals(lst) -> list:
     return _js_sorted(out)
 
 
-# --- execution options (phase 2a) -------------------------------------------
-# MUST MATCH the same functions in api/lib/backtest-datasets.mjs, message for
-# message: `ot check` / the API refuse with those words, and this package must
-# refuse the same manifests the same way.
+# Execution options. Keep validation and messages in sync with
+# api/lib/backtest-datasets.mjs.
 
 ASSUMED_ORDER_RULES = {"tick": 0.001, "min_size": 5, "size_step": 0.01}
 

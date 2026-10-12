@@ -1,16 +1,12 @@
-"""Backtest ANY Polymarket binary market from your own data.
+"""Backtest Polymarket binary markets from local data.
 
-A port of runner/generic-data.mjs -- read its header for the rules and why.
-MUST MATCH it line for line in behaviour: the equivalence suite compares every
-event and every market record the two produce from the same dataset.
-
-Three ways in:
-  - a dataset directory: markets.json / markets.jsonl at its top, plus any
-    number of `*.jsonl` / `*.jsonl.gz` frame files (Polymarket CLOB
-    market-channel frames, raw or as archive rows) anywhere under it;
-  - Dataset.from_frames(markets, frames): the same, in memory;
-  - Dataset.from_pmdata(l2, trades=None, market=...): the single-book table
-    shape (bid_prices/ask_prices/... rows), its other token mirrored.
+Keep behavior in sync with runner/generic-data.mjs. Equivalence tests compare
+events and market records. Supported inputs:
+  - a directory containing markets.json / markets.jsonl and *.jsonl / *.jsonl.gz
+    CLOB market-channel frames, raw or archive-wrapped, anywhere below it;
+  - Dataset.from_frames(markets, frames), for in-memory frames;
+  - Dataset.from_pmdata(l2, trades=None, market=...), for a single-book table
+    with bid_prices/ask_prices/... columns and a mirrored second token.
 """
 
 from __future__ import annotations
@@ -67,7 +63,7 @@ _ISO = re.compile(r"^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d+
 
 
 def parse_iso_ms(v):
-    """An ISO-like date-time WITH an explicit zone -> epoch ms. MUST MATCH parseIsoMs."""
+    """An ISO-like date-time WITH an explicit zone -> epoch ms. Keep in sync with parseIsoMs."""
     if not isinstance(v, str):
         return None
     m = _ISO.match(v.strip())
@@ -147,7 +143,7 @@ def _is_gamma(e: dict) -> bool:
 
 
 def generic_record(entry):
-    """One markets-file entry -> (id, record) or (id, None, why). MUST MATCH genericRecord."""
+    """One markets-file entry -> (id, record) or (id, None, why). Keep in sync with genericRecord."""
     if not isinstance(entry, dict):
         return None, None, "entry is not an object"
     gamma_only = _is_gamma(entry)
@@ -253,7 +249,7 @@ def generic_record(entry):
 
 
 def index_generic_markets(entries):
-    """MUST MATCH indexGenericMarkets."""
+    """Keep in sync with indexGenericMarkets."""
     if not isinstance(entries, list):
         raise DatasetError("the markets file must hold a list of markets")
     markets, rejected, by_slug, by_token = {}, [], {}, {}
@@ -325,7 +321,7 @@ def _nn(a, b):
 
 
 class FrameRouter:
-    """MUST MATCH FrameRouter in runner/generic-data.mjs."""
+    """Keep in sync with FrameRouter in runner/generic-data.mjs."""
 
     def __init__(self, markets, by_slug, by_token):
         self.markets = markets
@@ -617,7 +613,7 @@ def _parsed(path):
 
 
 def sorted_events(path, count, run_size=SORT_RUN, fan_in=MERGE_FANIN):
-    """(ts, seq) order in bounded memory. MUST MATCH sortedEvents."""
+    """(ts, seq) order in bounded memory. Keep in sync with sortedEvents."""
     if count <= run_size:
         evs = list(_parsed(path))
         evs.sort(key=_key)
@@ -677,7 +673,7 @@ def apply_book_event(book, ev, generic=True):
 
 
 class QuoteState:
-    """The external quote per token. MUST MATCH QuoteState in runner/generic-data.mjs."""
+    """The external quote per token. Keep in sync with QuoteState in runner/generic-data.mjs."""
 
     def __init__(self, book_factory):
         self.book = book_factory()
@@ -762,7 +758,7 @@ def _book_levels(book):
 
 
 def resolution_of(rec, frame):
-    """MUST MATCH resolutionOf."""
+    """Keep in sync with resolutionOf."""
     ev = list(rec["evidence"]) + ([frame] if frame else [])
     if not ev:
         return None, None
@@ -796,7 +792,7 @@ def _final_record(rec, start, trade_until, resolution):
 
 
 def rules_readable(rec) -> bool:
-    """MUST MATCH rulesReadable in runner/generic-data.mjs."""
+    """Keep in sync with rulesReadable in runner/generic-data.mjs."""
     tick, mn = rec.get("tick_size"), rec.get("min_size")
 
     def num(v):
@@ -813,7 +809,7 @@ def rules_readable(rec) -> bool:
 
 def decode_generic(*, entries, frames=None, feed=None, events_dir, book_factory, mark_max_age_ms=None,
                    order_rules=False):
-    """MUST MATCH decodeGeneric. `frames`: iterable of (at, text_line) or (at, parsed_frame, True)."""
+    """Keep in sync with decodeGeneric. `frames`: iterable of (at, text_line) or (at, parsed_frame, True)."""
     markets, rejected, by_slug, by_token = index_generic_markets(entries)
     if not markets:
         first = f" ({rejected[0]['market_id'] or '?'}: {rejected[0]['why']})" if rejected else ""
@@ -1055,20 +1051,19 @@ def _mirror(levels):
 def _pmdata_feed(mid, rec, l2, trades):
     """The single-book table shape -> internal events on `mid`.
 
-    The l2 table carries ONE book (outcome index 0); the other token is its
+    The l2 table carries one book (outcome index 0); the other token is its
     mirror, applied atomically (a snapshot names both tokens, a delta carries
     `mirror: true`). Trades come only from `trades`, so each public print
     reaches the engine once.
     """
     labels = [lb.strip().lower() for lb in rec["labels"]]
 
-    # The slug every row must carry when it carries one: the market's own, or --
-    # for a record without one -- the first a row names. Two slugs in one table
-    # are two markets, whichever is "right".
+    # Rows must share the record's slug, or the first row's slug when the
+    # record has none. Reject tables containing multiple market slugs.
     expected = {"slug": rec["slug"]}
 
     def other_market(row):
-        """A row that names a market, naming another one -- never routed here."""
+        """A row that names a market, naming another one; never routed here."""
         cid = _plain(row.get("condition_id"))
         if cid is not None and js_string(cid) != mid:
             return f"condition_id {js_string(cid)}"

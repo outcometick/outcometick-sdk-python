@@ -1,10 +1,8 @@
-"""Load the replay engine -- the very files the sandbox image runs.
+"""Load the replay engine used by the sandbox image.
 
-otengine.py, otfeed.py, otreplay.py and otharness.py import each other by bare
-name, as they do inside the container, so they are registered under those
-names here rather than rewritten. In the installed package they sit in
-`_sandbox/` beside this file (scripts/build-packages.mjs copies them byte for
-byte); in the source repository they are read from runner/harness/python.
+Register otengine, otfeed, otreplay and otharness under their bare import names.
+Installed packages contain copies in _sandbox/; source checkouts load them from
+runner/harness/python.
 """
 
 from __future__ import annotations

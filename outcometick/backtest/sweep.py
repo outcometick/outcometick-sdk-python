@@ -1,26 +1,13 @@
-"""Parameter sweeps — and the out-of-sample check that keeps them honest.
+"""Grid search with optional chronological holdout validation.
 
-A grid search over one archive always finds a winner; whether it found an edge
-or the noise in those particular days is a different question, and the only
-answer is days the search never saw. So `sweep` can hold days back: the grid is
-ranked on the earlier days, and the top cells are then replayed on the held-out
-later ones and reported side by side. A cell that tops the in-sample table and
-loses money out of sample is a fitted coincidence, and the table says so.
+Rank cells on earlier days, then replay the top cells on held-out later days.
+Each cell is a run() using cached decoded days.
 
-Every cell is an ordinary `run()` over the same decoded days (decoded once, then
-served from the cache), so a cell's numbers are exactly what a single run with
-those params reports.
-
-`cell_workers=N` runs N cells at a time, each on its own forked process, and
-returns what the sequential sweep returns. The first cell of each pass (the ranking and
-the held-out replay) runs here, so its days are decoded into the cache once,
-before any process starts. What a sequential sweep carries from one cell to the
-next is state the strategy keeps outside its instance -- on its class (and the
-classes inside it) or in the params dict -- and a forked cell cannot hand that
-on: each one checks it afterwards, and from the first cell that changed it,
-failed or died, the sweep goes on here, one cell after another (the cells still
-running are killed). State elsewhere (module globals) is outside run()'s
-contract already. A process with other threads running is not forked.
+cell_workers runs cells in forked processes. The first cell of each pass runs
+locally to warm the cache. If a cell fails, dies or changes class state
+(including nested classes) or params, resume sequentially from that cell and
+kill remaining children. Module globals are outside run()'s state contract.
+Do not fork while other threads are running.
 """
 
 from __future__ import annotations
@@ -144,32 +131,26 @@ def _cells(run_cell, params_list, cell_workers, state):
     if before is None:
         return done + [run_cell(p) for p in rest]
     accepted = _forked(run_cell, rest, cell_workers, state, before)
-    # From the first cell a fork could not stand in for: here, in order, as a
-    # sequential sweep would have run it.
+    # Resume sequentially at the first cell not accepted from parallel replay.
     return done + accepted + [run_cell(p) for p in rest[len(accepted):]]
 
 
 def _forked(run_cell, params, workers, state, before):
-    """The longest prefix of [run_cell(p) for p in params] that forked processes
-    could stand in for: it stops at the first cell that failed, died or changed
-    the state. One process per cell, `workers` at a time, each in its own process
-    group. A cell's answer is a file it renames into place when done, read once
-    the cell has exited and its whole group is gone -- nothing a dying cell or
-    something it started can leave half-written or hold open. Whatever is still
-    running when this returns (or is interrupted) is killed with all it started.
+    """Return the longest prefix of cells safe to accept from parallel replay.
+    Stop at the first failed, dead or state-mutating cell. Run up to workers
+    children, each in its own process group. Publish answers by rename and read
+    them only after the child exits and its process group is gone. Kill all
+    remaining groups on return or interruption.
 
-    Plain os.fork, not multiprocessing: a cell is reaped only here, after its
-    group is killed, so the group id cannot have been handed to anyone else.
+    Use os.fork so reaping stays under this function's control. Kill the group
+    before reaping the child to prevent process-group id reuse.
     """
     out_dir = tempfile.mkdtemp(prefix="ot-sweep-")
     answer = lambda i: os.path.join(out_dir, f"{i}.pkl")  # noqa: E731
 
     def fork(i):
-        # Ctrl-C held off from fork() until the cell is in `running`: an
-        # interrupt in between would leave a cell nobody kills or reaps. Not a
-        # signal mask -- with any other OS thread alive the kernel delivers the
-        # SIGINT there and Python still raises it here -- but a handler that
-        # only notes it, then the previous one, given the same signal.
+        # Defer Ctrl-C until the child is tracked for cleanup. Use a handler;
+        # another OS thread could receive SIGINT despite a signal mask.
         noted = []
         previous = signal.signal(signal.SIGINT, lambda *a: noted.append(a))
         try:
@@ -184,7 +165,7 @@ def _forked(run_cell, params, workers, state, before):
                         fh.write(payload)
                     os.replace(answer(i) + ".tmp", answer(i))
                     code = 0
-                except BaseException:  # noqa: BLE001 -- no answer: the parent reruns it and raises as it would have
+                except BaseException:  # noqa: BLE001; no answer: the parent reruns it and raises as it would have
                     pass
                 finally:
                     os._exit(code)
@@ -215,8 +196,7 @@ def _forked(run_cell, params, workers, state, before):
             i = len(accepted)
             if i not in running:
                 break
-            # Exited, not yet reaped -- and still in `running`, so an interrupt
-            # while waiting on it kills it with the rest.
+            # Keep the exited child tracked until reaped so interrupts still clean it up.
             os.waitid(os.P_PID, running[i], os.WEXITED | os.WNOWAIT)
             _kill_group(running[i])
             os.waitpid(running.pop(i), 0)
@@ -254,16 +234,15 @@ def sweep(strategy, data, grid, *, metric="net_pnl", maximize=None, holdout=0.0,
     grid      {param: [values, ...]}, layered over `params` (or the class's own).
     metric    a key of report["metrics"]; maximize defaults to True except for
               drawdown-, loss- and error-type metrics.
-    holdout   fraction of the days (the LATEST ones) kept out of the ranking;
+    holdout   fraction of the days (the latest ones) kept out of the ranking;
               the `top` cells are then replayed on them. 0 = rank on everything.
     cell_workers  None (default): one cell after another. A number: that many
-              cells at once on forked processes -- the same result (see the
+              cells at once on forked processes; the same result (see the
               module docstring; needs fork, else sequential).
     Everything else (venue, assets, datasets, latency_ms, workers, ...) is
     passed to run() for every cell.
     """
-    # The package itself, imported late: sweep.py is imported BY the package's
-    # __init__, which defines run() and BacktestError.
+    # Import late to avoid a cycle with __init__, which defines run and BacktestError.
     pkg = importlib.import_module(__package__)
     BacktestError, run = pkg.BacktestError, pkg.run
     from .local import local_days

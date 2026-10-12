@@ -1,5 +1,6 @@
-"""The JS contract tables, generated into _contract.json by
-scripts/gen-backtest-contract.mjs. Never edited by hand."""
+"""JS contract tables generated into _contract.json by
+scripts/gen-backtest-contract.mjs. Do not edit the tables by hand.
+"""
 
 import json
 import os

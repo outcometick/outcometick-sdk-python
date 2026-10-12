@@ -1,10 +1,8 @@
-"""The job stream, exactly as the worker writes it.
+"""Frame the job stream consumed by otharness.py.
 
-market mode: a header per market, then its events (runner/worker.mjs,
-cli/commands/run.mjs). session mode: one time order across every market -- a
-port of runner/session-feed.mjs, whose comments explain why. The shared loop in
-otharness.py consumes these lines whether they came over a pipe from Node or
-from this generator, so a pure-Python run and a queued run are framed the same.
+Market mode writes a header followed by events for each market. Session mode
+merges markets in time order. Keep in sync with runner/session-feed.mjs and
+the market streams in runner/worker.mjs and cli/commands/run.mjs.
 """
 
 from __future__ import annotations
@@ -81,7 +79,7 @@ def session_lines(markets, *, lines_of, header_of, cursor_of=None, timed=False):
     """session mode: every market merged into one time order.
 
     Ties at one millisecond: an opening first, then events in market order,
-    then closings -- MUST MATCH sessionLines in runner/session-feed.mjs.
+    then closings; Keep in sync with sessionLines in runner/session-feed.mjs.
     """
     heap: list = []
 
@@ -100,7 +98,7 @@ def session_lines(markets, *, lines_of, header_of, cursor_of=None, timed=False):
 
     def push_generic(c):
         """A generic market: streamed, `end` (phase 2) then `close` (phase 3);
-        events tie-break on the global input sequence. MUST MATCH
+        events tie-break on the global input sequence. Keep in sync with
         advanceGeneric in runner/session-feed.mjs."""
         line = next(c["it"], None)
         if line is not None:

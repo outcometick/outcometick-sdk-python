@@ -9,24 +9,20 @@
     result = run(Favourite, load_sample())
     print(result.summary())
 
-The same engine, decoder, settlement, fees and report as a backtest queued on
-outcometick.com and as `ot run` -- not a lookalike. client/backtest/
-equivalence.test.mjs replays the public samples through this package and
-through `ot run` and requires every trade, fill and report field to match.
+Uses the hosted engine and the same decoding, settlement, fee and report rules
+as `ot run`. Equivalence tests compare trades, fills and report fields.
 
-Limits, stated plainly:
-  - Market orders that take liquidity (IOC) only. No resting orders: a fill for
-    a resting order needs a queue-position model, and a guessed one inflates
-    market-making returns.
-  - Depth is the archived book, reconstructed and thinned to the capture
-    cadence; the top-of-book stream can only delete levels, never add them.
-  - Polymarket fees are the venue's taker schedule per market, computed per
-    book level (an estimate: the venue rounds per maker order matched). The
-    archive has no Predict.fun fee schedule, so those runs are fee-free unless
-    you pass `fee_bps`.
-  - Reference feeds (Binance) live on our runner, not in the archive, so a run
-    that needs them has to be submitted rather than run here. Custom CSV series
-    (`series`) are read by `ot run` and the hosted runner, not yet by this one.
+Limitations:
+  - Resting orders require Polymarket book and trade data. Queue positions are
+    modeled, not observed; the default puts unexplained cancellations behind
+    the order. Alternative queue models are available through queue_model.
+  - Depth is reconstructed from the archived book and thinned to capture
+    cadence. Top-of-book rows prune levels but cannot restore missing sizes.
+  - Polymarket taker fees are estimated per book level; the venue rounds per
+    matched maker order. Predict.fun has no archived fee schedule and defaults
+    to zero fees unless fee_bps is supplied.
+  - Binance reference feeds are available only on the hosted runner. Custom
+    CSV series are supported by `ot run` and the hosted runner, not this package.
 """
 
 from __future__ import annotations
@@ -102,7 +98,7 @@ class Result:
         # per-instance samples they were built from (record.csv / record_markets.csv).
         self.record = (record or {}).get("points") or []
         self.record_markets = (record or {}).get("samples") or []
-        # One row per market replayed, entered or not -- markets.csv in a
+        # One row per market replayed, entered or not; markets.csv in a
         # hosted or `ot run` archive (report.MARKET_COLUMNS).
         self.markets = markets if markets is not None else []
 
@@ -199,14 +195,14 @@ def run(strategy, data, *, venue=None, assets=None, days=None, datasets=None, in
         cancel_latency_ms=None, cache=True, workers=None, mark_max_age_ms=None, fok=False, order_rules=None,
         maker_rebate=None, quote_guard=None, mirror_depth=None, book_throttle=None, feed_latency=None,
         queue_model=None, record_ms=None) -> Result:
-    """Backtest `strategy` (a class) over an unpacked archive at `data` -- or
-    over your own data for ANY Polymarket binary market: a `Dataset`, or a
+    """Backtest `strategy` (a class) over an unpacked archive at `data`, or
+    over your own data for any Polymarket binary market: a `Dataset`, or a
     directory with markets.json / markets.jsonl and CLOB frame files.
 
     Generic data: every market in it is replayed (no assets / days / intervals);
     datasets are what the frames hold. A resolved market pays at its resolution
     time; an unresolved one is valued at the external mid (else last public
-    trade) when trading ends -- `mark_max_age_ms` refuses older marks (a leg
+    trade) when trading ends; `mark_max_age_ms` refuses older marks (a leg
     with no usable mark is valued at 0, and the report says so).
 
     Execution options (all off by default; same meaning as the manifest keys):
@@ -222,7 +218,7 @@ def run(strategy, data, *, venue=None, assets=None, days=None, datasets=None, in
                   venue's book). on_timer + ctx.schedule() wake the strategy
                   at chosen times.
     queue_model   resting orders: where unexplained book decreases came from in
-                  the queue -- {"prob": "power", "n": 2} (power/power2/power3,
+                  the queue: {"prob": "power", "n": 2} (power/power2/power3,
                   n 1..10) or {"prob": "log"} (log/log2). None: the conservative
                   default (cancellations behind the order).
     record_ms     the account's value every record_ms milliseconds (1000..3600000),
@@ -241,8 +237,8 @@ def run(strategy, data, *, venue=None, assets=None, days=None, datasets=None, in
               datasets to include "book" and "trades", and Polymarket.
     cache     keep decoded days under ~/.cache/outcometick/decoded (or a path),
               so the next run over the same days starts at once. False: never.
-    workers   None (default): decode on every CPU core, replay in this process —
-              always the single-process result. A number: decode AND replay
+    workers   None (default): decode on every CPU core, replay in this process;
+              always the single-process result. A number: decode and replay
               markets on that many processes (market mode). Parallel replay
               relies on market mode's contract: a strategy keeps its state on
               the instance. State found on its class (nested classes included)
@@ -288,11 +284,8 @@ def run_template(path, data, *, venue=None, assets=None, days=None, seed=1, fee_
     import importlib.util
     import json
 
-    # The directory as it stands BEFORE any of its code runs: the manifest is
-    # parsed from this snapshot and the run's fingerprint is taken from it. The
-    # strategy's own code could rewrite its files while it loads or runs, so
-    # the directory is compared with the snapshot after loading and after the
-    # run, and a change refuses the run rather than reporting the wrong files.
+    # Snapshot source and manifest before executing strategy code. Compare after
+    # loading and replay to reject changes that invalidate the fingerprint.
     snapshot = read_submission(path)
     doc_file = next((f for f in snapshot if f["name"] == "outcometick.json"), None)
     if doc_file is None:
@@ -303,8 +296,7 @@ def run_template(path, data, *, venue=None, assets=None, days=None, seed=1, fee_
     if doc.get("reference"):
         raise BacktestError("E_MANIFEST", "reference feeds live on the runner, not in the archive — submit this one instead")
     if doc.get("series"):
-        # Refused rather than dropped: replaying without them would hand ctx.ext()
-        # nothing and report a run that `ot run` and the queue would not produce.
+        # Reject unavailable feeds rather than giving ctx.ext() empty input.
         raise BacktestError("E_MANIFEST", "custom series (manifest \"series\") are not read by the Python runner yet — "
                                           "run this one with `ot run` or submit it")
     file_name, _, class_name = str(doc.get("entry", "")).rpartition(":")
@@ -315,19 +307,11 @@ def run_template(path, data, *, venue=None, assets=None, days=None, seed=1, fee_
     if spec is None or spec.loader is None or entry_file is None:
         raise BacktestError("E_ENTRY", f"could not load {file_name}")
     module = importlib.util.module_from_spec(spec)
-    # Registered before it runs, as the sandbox harness does: dataclasses and
-    # typing resolve a class's module through sys.modules, so a strategy using
-    # @dataclass with postponed annotations fails to import otherwise.
+    # Register before execution so dataclasses and typing can resolve the module.
     previous = sys.modules.get(module_name)
     sys.modules[module_name] = module
-    # Bytecode caches are read from a fresh, empty directory for as long as the
-    # strategy loads and runs: a stale .pyc beside an edited source (same size,
-    # same second) would otherwise run code the fingerprint does not describe.
-    # The entry itself is compiled from the snapshot's text, not from disk.
-    # A module this process already imported from the strategy directory (a
-    # helper, in a notebook that ran the strategy before) would be reused as
-    # is, whatever the file says now: forget them, so every import comes from
-    # the files just hashed.
+    # Use an empty bytecode cache and reload strategy modules so imports match
+    # the hashed source. Compile the entry from the snapshot.
     root = os.path.realpath(path) + os.sep
     own_names = {os.path.splitext(f["name"])[0].replace("/", ".") for f in snapshot if f["name"].endswith(".py")}
     own_names |= {n.split(".")[0] for n in own_names}
@@ -360,8 +344,7 @@ def run_template(path, data, *, venue=None, assets=None, days=None, seed=1, fee_
         import shutil as _shutil
         _shutil.rmtree(sys.pycache_prefix, ignore_errors=True)
         sys.pycache_prefix = previous_prefix
-        # Remembered, so the next run_template -- of this directory or any
-        # other -- imports its own files rather than these.
+        # Track loaded modules so later runs can reload their own source.
         _STRATEGY_MODULES.update(n for n, m in list(sys.modules.items())
                                  if isinstance(getattr(m, "__file__", None), str)
                                  and os.path.realpath(m.__file__).startswith(root))
@@ -442,8 +425,8 @@ def _fingerprint(manifest, source_files, *, scope, seed, data, fee_bps_override,
     if source_files is not None:
         return fingerprint_of_files(source_files, scope=scope, seed=int(seed), data=data, fee_bps_override=fee_bps_override,
                                     data_sha256=data_sha256, replay=replay, inputs=inputs)
-    # An in-process class has no file bytes to hash, and a parsed number past
-    # 2^53 would round in the shared canonical form: its manifest, exactly.
+    # In-process classes have no source bytes to hash. Preserve the manifest
+    # text because canonical JSON would round numbers beyond 2^53.
     exact = hashlib.sha256(json.dumps(manifest, sort_keys=True, default=repr).encode("utf-8")).hexdigest()
     fp = run_fingerprint(manifest=manifest, code=None, scope=scope, seed=int(seed), data=data,
                          data_sha256=data_sha256, replay=replay, py_exact=exact)
@@ -578,11 +561,8 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, wo
             raise BacktestError("E_MANIFEST", str(err)) from None
         run_inputs: list = []
         for day in want_days:
-            # A fresh throttle each day, as the hosted runner and `ot run` decode: the
-            # cadence comes from the whole range, but which rows a day keeps never
-            # depends on the day decoded before it (a market across midnight would
-            # otherwise lose its first rows after it -- and the cache, which keeps
-            # days one by one, would depend on which run wrote it).
+            # Choose cadence from the whole range, with a fresh throttle each day.
+            # This keeps cached days independent of earlier decodes.
             throttle = (None if book_throttle is False
                         else BookThrottle(venue=venue, assets=scope_assets, frm=want_days[0], to=want_days[-1]))
             kw = dict(root=root, day=day, venue=venue, assets=scope_assets, datasets=manifest["datasets"],
@@ -670,9 +650,7 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, wo
                     raise RunAbort("E_HOOK_SIG", f"{h} was declared but {h}() is not defined on the class")
             return klass
 
-        # The fingerprint is taken BEFORE any strategy code runs, from a deep
-        # copy: a strategy that rewrote its own params mid-run must not change
-        # what the report says it was run with.
+        # Fingerprint a deep copy before strategy execution can mutate params.
         fingerprint = _fingerprint(
             copy.deepcopy(manifest), source_files, seed=seed, data="archive", fee_bps_override=fee_bps_override,
             scope={
@@ -780,7 +758,7 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, wo
 def _run_generic(manifest, get_class, *, data, venue, days, seed, workers, mark_max_age_ms, source_files=None,
                  fee_bps_override=None) -> Result:
     """Generic data (generic.py): the same replay and report as an archive run,
-    with the generic report fields. MUST MATCH the generic branch of
+    with the generic report fields. Keep in sync with the generic branch of
     cli/commands/run.mjs."""
     _validate(manifest)
     if days:
@@ -857,7 +835,7 @@ def _run_generic(manifest, get_class, *, data, venue, days, seed, workers, mark_
                     raise RunAbort("E_HOOK_SIG", f"{h} was declared but {h}() is not defined on the class")
             return klass
 
-        # Before any strategy code runs -- see the archive path.
+        # Before any strategy code runs; see the archive path.
         fingerprint = _fingerprint(copy.deepcopy(manifest), source_files,
                                    scope={"venue": "polymarket", "assets": [], "days": []},
                                    seed=seed, data="generic", fee_bps_override=fee_bps_override,

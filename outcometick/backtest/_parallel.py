@@ -266,6 +266,12 @@ def _add_result(total, r):
         t["bytes"] += rc.get("bytes") or 0
         t["truncated"] = bool(t["truncated"] or rc.get("truncated")
                               or t["rows"] > _record_limits()[0] or t["bytes"] > _record_limits()[1])
+    # Spot counters (the spot dataset declared): absent otherwise, like the harness.
+    sp = r.get("spot")
+    if isinstance(sp, dict):
+        t = total.setdefault("spot", {"markets": 0, "markets_without": 0})
+        for k in t:
+            t[k] += sp.get(k) or 0
     # Timer counters (on_timer declared): absent otherwise, like the harness.
     tm = r.get("timers")
     if isinstance(tm, dict):

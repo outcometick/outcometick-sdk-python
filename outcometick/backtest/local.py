@@ -182,7 +182,7 @@ def _market_day_key(m):
     return f"{str(mk['asset']).upper()}|{'none' if iv is None else iv}"
 
 
-def spool_day(*, day, markets, by_slug, throttle, events_dir, feed, rows_of, book_factory):
+def spool_day(*, day, markets, by_slug, throttle, events_dir, feed, rows_of, book_factory, spot=False):
     """Decode a day's files into one event file per usable market."""
     os.makedirs(events_dir, exist_ok=True)
     buffers: dict = {}
@@ -209,7 +209,7 @@ def spool_day(*, day, markets, by_slug, throttle, events_dir, feed, rows_of, boo
             if meta["dataset"] == "markets":
                 continue
             for row in rows_of(f):
-                for market_id, ev in events_from_row(f, row, markets, by_slug, throttle, meta):
+                for market_id, ev in events_from_row(f, row, markets, by_slug, throttle, meta, spot):
                     if ev.get("bbo"):
                         bbo_seen.add(_market_day_key(markets.get(market_id)))
                     key = str(market_id)
@@ -369,7 +369,7 @@ def _stripe(k):
                 probe.calls = []
                 try:
                     evs = events_from_row(f, row, markets, st["by_slug"],
-                                          probe if st["throttle"] is not None else None, meta)
+                                          probe if st["throttle"] is not None else None, meta, st["spot"])
                 except Exception as err:  # noqa: BLE001
                     if not probe.calls:
                         raise
@@ -454,7 +454,8 @@ def _merge_bucket(b):
     return results, last
 
 
-def spool_day_parallel(*, day, markets, by_slug, throttle, events_dir, feed, root, book_factory, workers, ctx):
+def spool_day_parallel(*, day, markets, by_slug, throttle, events_dir, feed, root, book_factory, workers, ctx,
+                       spot=False):
     """spool_day, on `workers` processes. Same output, same throttle state after."""
     os.makedirs(events_dir, exist_ok=True)
     work = tempfile.mkdtemp(prefix=f"{day}-par-", dir=events_dir)
@@ -466,7 +467,7 @@ def spool_day_parallel(*, day, markets, by_slug, throttle, events_dir, feed, roo
     _PSTATE.clear()
     _PSTATE.update(n=workers, markets=markets, by_slug=by_slug, throttle=throttle, feed=feed, root=root,
                    dir=work, buckets=buckets, bucket=bucket, bucket_markets=bucket_markets, day=day,
-                   events_dir=events_dir, book_factory=book_factory)
+                   events_dir=events_dir, book_factory=book_factory, spot=spot)
     try:
         # ProcessPoolExecutor rather than multiprocessing.Pool: a worker that is
         # killed (out of memory, say) raises BrokenProcessPool here instead of
@@ -502,6 +503,8 @@ def _rm(p):
 def load_local_day(*, root, day, venue, assets, datasets, intervals, throttle, events_dir, book_factory,
                    workers=1, ctx=None):
     archive_datasets = archive_datasets_for_day(datasets=datasets, venue=venue, day=day, frm=day, to=day)
+    # `spot` is decoded from the `prices` tree into its own events (DATASETS.spot).
+    spot = "spot" in (datasets or [])
     want_intervals = normalize_intervals(intervals)
     all_paths = walk(root)
     wanted = [r for r in all_paths if day_of_path(r) == day and file_matches_run(
@@ -534,10 +537,10 @@ def load_local_day(*, root, day, venue, assets, datasets, intervals, throttle, e
     if workers > 1 and ctx is not None and len(markets) > 1:
         spooled = spool_day_parallel(day=day, markets=markets, by_slug=by_slug, throttle=throttle,
                                      events_dir=events_dir, feed=feed, root=root, book_factory=book_factory,
-                                     workers=workers, ctx=ctx)
+                                     workers=workers, ctx=ctx, spot=spot)
     else:
         spooled = spool_day(day=day, markets=markets, by_slug=by_slug, throttle=throttle, events_dir=events_dir,
-                            feed=feed, rows_of=lambda rel: read_rows(root, rel), book_factory=book_factory)
+                            feed=feed, rows_of=lambda rel: read_rows(root, rel), book_factory=book_factory, spot=spot)
     out, unusable = spooled["out"], spooled["unusable"]
     reason = None
     if not out and unusable:

@@ -633,6 +633,7 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, wo
             "fees": fees,
             "resting": resting_policy_for(manifest, venue),
             **({"engine": policy} if policy else {}),
+            **({"spot": True} if "spot" in (manifest.get("datasets") or []) else {}),
             "limits": CONTRACT["limits"],
             "fillDelayMs": manifest.get("latency") or 0,
         }
@@ -743,6 +744,7 @@ def _run(manifest, get_class, *, data, venue, assets, days, seed, cache=True, wo
             orders=orders_report(policy=policy, stats=result.get("orders")),
             timers=result.get("timers") if policy and policy.get("timers") else None,
             record=rec["block"],
+            spot=result.get("spot") if "spot" in (manifest.get("datasets") or []) else None,
             market_summaries=list(meta.values()),
             market_meta=meta,
             fees_paid=result["fees_paid"],
@@ -992,6 +994,8 @@ def _parse_result(r: dict) -> dict:
         "orders": _order_stats(r.get("orders"), fin),
         "timers": ({k: (r["timers"].get(k) if fin(r["timers"].get(k)) else 0) for k in ("created", "fired", "dropped")}
                    if isinstance(r.get("timers"), dict) else None),
+        "spot": ({k: (r["spot"].get(k) if fin(r["spot"].get(k)) else 0) for k in ("markets", "markets_without")}
+                 if isinstance(r.get("spot"), dict) else None),
         "record": ({"rows": r["record"]["rows"] if fin(r["record"].get("rows")) else 0,
                     "bytes": r["record"]["bytes"] if fin(r["record"].get("bytes")) else 0,
                     "truncated": r["record"].get("truncated") is True}

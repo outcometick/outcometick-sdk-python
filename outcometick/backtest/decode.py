@@ -275,7 +275,7 @@ class BookThrottle:
 
 # --- rows -> events -------------------------------------------------------
 
-def events_from_row(file_path, row, markets, by_slug=None, throttle=None, meta=None):
+def events_from_row(file_path, row, markets, by_slug=None, throttle=None, meta=None, spot=False):
     meta = meta or classify_path(file_path)
     slug_index = by_slug if by_slug is not None else build_slug_index(markets)
     ds = meta["dataset"]
@@ -318,6 +318,17 @@ def events_from_row(file_path, row, markets, by_slug=None, throttle=None, meta=N
                 "server_ts_ms": server_ms,
                 "recv_ts_ms": recv_ms,
             }))
+        # spot, when declared -- eventsFromRow in runner/events.mjs.
+        if spot and ds == "prices" and meta["venue"] == "polymarket" and meta["asset"]:
+            for mid, m in markets.items():
+                if not m["asset"] or js_string(m["asset"]) != js_string(meta["asset"]):
+                    continue
+                if m["open_ts_ms"] is not None and ts < m["open_ts_ms"]:
+                    continue
+                if m["close_ts_ms"] is not None and ts > m["close_ts_ms"]:
+                    continue
+                out.append((mid, {"kind": "spot", "ts_ms": ts, "market_id": mid, "value": value,
+                                  "server_ts_ms": server_ms, "recv_ts_ms": recv_ms}))
         return out
 
     market = _market_for_row(row, markets, slug_index)
@@ -405,7 +416,7 @@ def events_from_row(file_path, row, markets, by_slug=None, throttle=None, meta=N
 
 # --- per market -----------------------------------------------------------
 
-_RANK = {"book": 0, "trade": 1, "tick": 2, "ref": 3, "ext": 4}
+_RANK = {"spot": -1, "book": 0, "trade": 1, "tick": 2, "ref": 3, "ext": 4}
 
 
 def market_unusable(market, in_window):

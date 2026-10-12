@@ -41,6 +41,9 @@
       "bbo": [
         "best_bid_ask"
       ],
+      "spot": [
+        "prices"
+      ],
       "trades": [
         "last_trade_price"
       ],
@@ -92,6 +95,10 @@
       },
       "bbo": {
         "from": "2026-09-03",
+        "to": null
+      },
+      "spot": {
+        "from": "2026-06-08",
         "to": null
       },
       "trades": {
@@ -204,6 +211,7 @@
     "twap60s",
     "book",
     "bbo",
+    "spot",
     "trades",
     "markets"
   ],
@@ -226,6 +234,6 @@
     "maxSweepCells": 256,
     "archiveRetentionDays": 7
   },
-  "sandbox_image_tag": "1.25.1",
+  "sandbox_image_tag": "1.26.0",
   "decode_semantics": 1
 }

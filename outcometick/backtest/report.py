@@ -765,7 +765,7 @@ def orders_report(*, policy, stats):
 def build_report(*, run_id, submitted_at, manifest, scope, source_sha256=None, trades, fill_summary,
                  market_summaries, market_meta, fees_paid=0, fill_delay_ms=0, fee_model=None, sweep=None,
                  coverage=None, crosschecks=(), budget=None, seed=None, scanned=None, maker=None, orders=None,
-                 timers=None, fingerprint=None, record=None):
+                 timers=None, fingerprint=None, record=None, spot=None):
     closed = [t for t in trades if _finite(t.get("pnl"))]
     equity = equity_curve(closed)
     matched = sum(1 for c in crosschecks if c.get("match"))
@@ -811,6 +811,7 @@ def build_report(*, run_id, submitted_at, manifest, scope, source_sha256=None, t
         **({"orders": orders} if orders else {}),
         **({"timers": timers} if timers else {}),
         **({"record": record} if record else {}),
+        **({"spot": spot} if spot else {}),
         "sweep": sweep,
         "coverage": coverage,
         "budget": budget,

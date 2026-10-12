@@ -64,6 +64,10 @@ def r4(x):
     return js_round_fixed(x, 4)
 
 
+def r6(x):
+    return js_round_fixed(x, 6)
+
+
 def _div(a, b):
     """`a / b` with IEEE results instead of ZeroDivisionError."""
     if b == 0:
@@ -540,8 +544,10 @@ def record_report(*, samples, record_ms, harness, max_rows=math.inf):
             "max_position_value": r2(max_pos),
             "mean_position_value": r2(sum_pos / len(pts)) if pts else None,
         },
-        "points": pts,
-        "samples": samples,
+        # Rounded where they are written out -- see recordReport.
+        "points": [{**p, "value": r6(p["value"]), "position_value": r6(p["position_value"])} for p in pts],
+        "samples": [{**x, "cash": r6(x["cash"]), "marked": r6(x["marked"]), "position_value": r6(x["position_value"])}
+                    for x in samples],
     }
 
 

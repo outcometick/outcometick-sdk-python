@@ -823,8 +823,10 @@ class Sweeps(unittest.TestCase):
         os.fork = fork
         try:
             with self.assertRaises(KeyboardInterrupt):
+                # workers=1: the first cell decodes in this process, so the only fork
+                # patched here is the sweep's own (a cold decode would fork a pool first).
                 sweep(HangsOn99, self.root, {"size": [5, 99]}, assets=["BTC"], params={"side": "UP"},
-                      cell_workers=2)
+                      cell_workers=2, workers=1)
         finally:
             os.fork = real_fork
         self.assertEqual(len(forked), 1)
